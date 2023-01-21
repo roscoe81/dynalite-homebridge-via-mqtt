@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#Northcliff Homebridge-Dynalite mqtt Bridge - Version 1.1 Gen
+#Northcliff Dynalite/Homebridge mqtt Bridge - Version 1.3 Gen
 import json
 import logging
 import asyncio
@@ -9,8 +9,8 @@ import aioconsole
 import asyncio_mqtt as aiomqtt
 from dynalite_lib.const import(CONF_AREA, CONF_NAME, CONF_PRESET, CONF_CHANNEL)
 
-logging.basicConfig(level=logging.DEBUG,
-#logging.basicConfig(level=logging.INFO,
+#logging.basicConfig(level=logging.DEBUG,
+logging.basicConfig(level=logging.INFO,
                     format="[%(asctime)s] %(name)s {%(filename)s:%(lineno)d} %(levelname)s - %(message)s")
 LOG = logging.getLogger(__name__)
 
@@ -103,15 +103,19 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                     
     def operate_window(self, parsed_json):
         target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(parsed_json["name"])
-        LOG.debug("Operating Window")
+        LOG.debug("Operating " + parsed_json["name"])
+        LOG.debug("Target Area: " + str(target_area) + " Off Preset: " + str(off_preset) + " On Preset: " + str(on_preset) + " Warm Preset: " + str(warm_preset))
         if target_area == None or on_preset == None or off_preset == None:
             LOG.info(parsed_json["name"] + " and/or its presets not found in config")
             return None
         else:
             if parsed_json["value"] == 0:
                 target_preset = off_preset
+                window_action = "closing"
             else:
                 target_preset = on_preset
+                window_action = "opening"
+        LOG.info(parsed_json["name"] + " " + window_action + ". Area " + str(target_area) + ", Preset " + target_preset)
         self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset))
         publish_parsed_json = {}
         publish_parsed_json["name"] = parsed_json["name"]
@@ -122,21 +126,25 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
     
     def operate_switch(self, parsed_json):
         target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(parsed_json["name"])
-        LOG.debug("Operating Switch: " + parsed_json["name"])
+        LOG.debug("Operating " + parsed_json["name"])
+        LOG.debug("Target Area: " + str(target_area) + " Off Preset: " + str(off_preset) + " On Preset: " + str(on_preset) + " Warm Preset: " + str(warm_preset))
         if target_area == None or on_preset == None or off_preset == None:
             LOG.info(parsed_json["name"] + " and/or its presets not found in config")
             return None
         else:
             if parsed_json["value"] == 0:
                 target_preset = off_preset
+                switch_action = "turning off"
             else:
                 target_preset = on_preset
+                switch_action = "turning on"
+        LOG.info(parsed_json["name"] + " " + switch_action + ". Area " + str(target_area) + ", Preset " + target_preset)
         self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset))
         return None
     
     def operate_light(self, parsed_json):
         target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(parsed_json["name"])
-        LOG.debug("Operating Light")
+        LOG.debug("Operating " + parsed_json["service_name"])
         LOG.debug("Target Area: " + str(target_area) + " Off Preset: " + str(off_preset) + " On Preset: " + str(on_preset) + " Warm Preset: " + str(warm_preset))
         if target_area != None and on_preset != None and off_preset != None:
             if parsed_json["name"] == parsed_json["service_name"]: #Unequal when operating a light within an area or invoking a warm cct preset
@@ -148,7 +156,7 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                     operate_entire_area = False
                     target_one_channel = self.identify_target_channel(int(target_area), parsed_json["service_name"])
                     if target_one_channel == None:
-                        print(parsed_json["service_name"], " not found in config")
+                        LOG.info(parsed_json["service_name"] + " not found in config")
                         return None
                 else:
                     warm_cct = True
@@ -156,29 +164,39 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
             if parsed_json["characteristic"] == "On":
                 if parsed_json["value"] and not warm_cct:
                     target_preset = on_preset
+                    light_action = "turning on"
                 elif parsed_json["value"] and warm_cct:
                     target_preset = warm_preset
+                    light_action = "setting to warm"
                 else:
                     target_preset = off_preset
+                    light_action = "turning off"
                 if operate_entire_area:
+                    LOG.info(parsed_json["name"] + " " + light_action + ". Area " + str(target_area) + ", Preset " + target_preset)
                     LOG.debug("Driving Light. Target Area: " + str(target_area) + " Target Preset: " + str(target_preset))
                     self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset))
                 else:
                     if parsed_json["value"]:
                         hb_brightness = 1
+                        light_action = "turning on"
                     else:
                         hb_brightness = 0
+                        light_action = "turning off"
                     LOG.debug("Targeted Channel: " + str(target_one_channel))
+                    LOG.info(parsed_json["service_name"] + " " + light_action + ". Area " + str(target_area) + ", Channel " + str(target_one_channel))
                     self.dyn.devices[CONF_AREA][target_area].channel[target_one_channel].turnOn(brightness=hb_brightness)
             elif parsed_json["characteristic"] == "Brightness":
                 hb_brightness = parsed_json["value"]/100
+                light_action = "brightness changing to "
                 if operate_entire_area:
                     target_channels = self.identify_area_channels(target_area)
                     if target_channels != []:
                         for target_channel in target_channels:
                             LOG.debug("Targeted Channel: " + str(target_channel))
+                            LOG.info(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + light_action + str(parsed_json["value"]) + "%. Area " + str(target_area) + ", Channel " + str(target_channel))
                             self.dyn.devices[CONF_AREA][target_area].channel[target_channel].turnOn(brightness=hb_brightness)
                 else:
+                    LOG.info(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_one_channel)][CONF_NAME] + " " + light_action + str(parsed_json["value"]) + "%. Area " + str(target_area) + ", Channel " + str(target_one_channel))
                     self.dyn.devices[CONF_AREA][target_area].channel[target_one_channel].turnOn(brightness=hb_brightness)                      
             else:
                 pass         
