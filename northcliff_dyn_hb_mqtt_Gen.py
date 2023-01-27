@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#Northcliff Dynalite/Homebridge mqtt Bridge - Version 1.29 Gen
+#Northcliff Dynalite/Homebridge mqtt Bridge - Version 1.30 Gen
 import json
 import logging
 import asyncio
@@ -472,7 +472,7 @@ def handleEvent(event=None, dynalite=None):
     if event_json["eventType"] == "CHANNEL" and event_json["direction"] == "IN":
         hbmqtt.update_hb_channel(event_json["data"])
         #print(event_json["data"])
-    elif event_json["eventType"] == CONF_PRESET and event_json["direction"] == "IN":
+    elif event_json["eventType"] == "PRESET" and event_json["direction"] == "IN":
         hbmqtt.update_hb_preset(event_json["data"])
         #print(event_json["data"])
     LOG.debug(event.toJson())
