@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#Northcliff Dynalite/Homebridge mqtt Bridge - Version 1.37 Gen
+#Northcliff Dynalite/Homebridge mqtt Bridge - Version 1.66_Gen
 import json
 import logging
 import asyncio
@@ -29,7 +29,7 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
         self.hb_outgoing_mqtt_topic = "homebridge/to/set" #Topic for messages to the Homebridge mqtt plugin
         self.hb_switch_functions = ["Towels", "Floor"]
         
-    def identify_area_presets(self, area_name): #Return an area preset and its on/open, off/close and warm cct presets for a specified area's name
+    def identify_area_presets(self, area_name): #Return an area preset and its on/opened, off/closed and warm cct presets for a specified area's name
         target_area = None
         on_preset = None
         off_preset = None
@@ -53,7 +53,7 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                 target_channels.append(int(channel))
         return target_channels
     
-    def identify_target_channel(self, area, channel_name): #Return an area's channel for a specified channel name within that area
+    def identify_target_channel(self, area, channel_name): #Return an area's channel number for a specified channel name within that area
         target_channel = None
         if CONF_CHANNEL in self.cfg[CONF_AREA][area]:
             for channel in self.cfg[CONF_AREA][area][CONF_CHANNEL]:
@@ -110,29 +110,80 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                                 pb_parsed_json = self.operate_window(parsed_json)
                             elif parsed_json["service_type"] == "Lightbulb":
                                 LOG.debug("Operate Light: " + str(parsed_json))
-                                pb_parsed_json = self.operate_light(parsed_json)
+                                pb_parsed_json = self.operate_light(parsed_json, switch_entire_area=False, match_linked_area=True)
                             elif parsed_json["service_type"] == "Switch":
                                 LOG.debug("Operate Switch: " + str(parsed_json))
                                 pb_parsed_json = self.operate_switch(parsed_json)
                             elif "Shutters" in parsed_json["name"] and parsed_json["characteristic"] == "TargetPosition":
                                 LOG.debug("Operate Shutters: " + str(parsed_json))
                                 pb_parsed_json = self.operate_window(parsed_json)
-                        if pb_parsed_json != {}:
+                        if pb_parsed_json != {}: #Provides the ability to update Homebridge button states after operation (e.g. showing a window has been opened/closed)
                             self.outgoing_mqtt(pb_parsed_json)
-                        if parsed_json["name"] == "Main Room Shades" and parsed_json["service_name"] != "Day Fresh":
-                            #This is a special that uses a dynalite "Good Morning" button to open blinds that respond to the hb_incoming topic.
-                            #It resets the Good Morning button when other blind settings are selected
-                            print("Resetting Main Bedroom Good Morning button")
-                            self.dyn.devices[CONF_AREA][148].presetOn(4)
+                        if parsed_json["name"] == "Main Room Shades":
+                            if parsed_json["value"] == 0:
+                                #This is a special that uses a dynalite "Good Morning" button to open blinds that respond to the hb_incoming topic.
+                                #It resets the Good Morning button when any blind is closed
+                                LOG.info("Resetting Main Bedroom Good Morning button")
+                                self.dyn.devices[CONF_AREA][148].presetOn(4)
+                            elif parsed_json["value"] == 100:
+                                #This is a special that uses a dynalite "Good Morning" button to open blinds that respond to the hb_incoming topic.
+                                #It sets the Good Morning button when any Main Bedroom window shade is opened
+                                LOG.info("Setting Main Bedroom Good Morning button")
+                                self.dyn.devices[CONF_AREA][148].presetOn(1)
+    
+    def check_valid_hb_message(self, pb_parsed_json): #Caters for situations where there's a Dynalite button that has no matching Homebridge button
+        valid_message = False
+        for button in self.hb_cfg:
+            if button["name"] == pb_parsed_json["name"] and button["service_name"] == pb_parsed_json["service_name"]:
+                valid_message = True
+        if not valid_message:
+            LOG.debug("Trying to set an invalid Homebridge Button. Message ignored. Name: " + pb_parsed_json["name"] + " Service Name: " + pb_parsed_json["service_name"])
+        return valid_message
                             
     def outgoing_mqtt(self, pb_parsed_json, topic="homebridge/to/set"): #Create an async loop task to publish mqtt messages
-        self.loop.create_task(self._outgoing_mqtt(pb_parsed_json, topic))
+        if self.check_valid_hb_message(pb_parsed_json):
+            self.loop.create_task(self._outgoing_mqtt(pb_parsed_json, topic))
     
     async def _outgoing_mqtt(self, pb_parsed_json, topic): #Publish an mqtt message
-        async with aiomqtt.Client("<Your mqtt broker IP address>") as client:
+        async with aiomqtt.Client("studypi.local") as client:
             await client.publish(topic, payload=json.dumps(pb_parsed_json))
             
-    def update_hb_channel(self, event_data): #Update a channel-specific Homebridge button's state to match the state of its area's preset
+    def match_linked_area(self, area_updated, off_preset, on_preset): # Match Slave Area Dynalite and HB button states for Linked Channels to the Master Area's states
+        if "Linked" in self.cfg[CONF_AREA][area_updated]:
+            LOG.debug("Linked Channel to Area Update " + str(self.cfg[CONF_AREA][area_updated]))
+            if self.cfg[CONF_AREA][area_updated]["Linked"]["Master"]:
+                all_linked_channels_on = True
+                all_linked_channels_off = True
+                for channel in self.cfg[CONF_AREA][area_updated]["Linked"]["Channels"]:
+                    LOG.debug("Channel " + str(channel) + " " + str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel)]["Preset"]))
+                    if str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel)]["Preset"]) != off_preset:
+                        all_linked_channels_off = False
+                    if str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel)]["Preset"]) != on_preset:
+                        all_linked_channels_on = False
+                LOG.debug("All Linked Channels Off " + str(all_linked_channels_off) + " All Linked Channels On " + str(all_linked_channels_on))
+                # Update Slave Area Dynalite and HB states if all linked Master Channels are either on or off
+                if all_linked_channels_on:
+                    pbln_parsed_json = {}
+                    pbln_parsed_json["characteristic"] = "On"
+                    pbln_parsed_json["name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
+                    pbln_parsed_json["service_name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
+                    pbln_parsed_json["value"] = True
+                    LOG.debug("All Linked Channels are On " + str(pbln_parsed_json))
+                    pb_parsed_json = self.operate_light(pbln_parsed_json, switch_entire_area=True, match_linked_area=False)
+                    LOG.debug("HB Linked Area Message " + str(pbln_parsed_json))
+                    self.outgoing_mqtt(pbln_parsed_json)
+                elif all_linked_channels_off:
+                    pblf_parsed_json = {}
+                    pblf_parsed_json["characteristic"] = "On"
+                    pblf_parsed_json["name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
+                    pblf_parsed_json["service_name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
+                    pblf_parsed_json["value"] = False
+                    LOG.debug("All Linked Channels are Off " + str(pblf_parsed_json))
+                    pb_parsed_json = self.operate_light(pblf_parsed_json, switch_entire_area=True, match_linked_area=False)
+                    LOG.debug("HB Linked Area Message " + str(pblf_parsed_json))
+                    self.outgoing_mqtt(pblf_parsed_json)
+            
+    def update_hb_channel(self, event_data): #Update a channel-specific Homebridge button's state to match the state of its area's preset. Match any linked area's dynalite state.
         LOG.debug("Update HB Channel " + str(event_data))
         area_updated = None
         for area in self.cfg[CONF_AREA]: #Find area and preset that's been updated and capture its new state
@@ -146,32 +197,60 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                     if channel == str(event_data[CONF_CHANNEL]):
                         channel_updated = channel
                 if channel_updated != None:
-                    if event_data["action"] == "cmd":
+                    if event_data["action"] == "cmd": #Only respond to Dynalite command messages
+                        LOG.debug("Update HB Channel " + str(event_data))
                         if CONF_PRESET in event_data:
                             target_preset = event_data[CONF_PRESET]
-                            target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(self.cfg[CONF_AREA][area_updated][CONF_NAME]) #Find On and Off presets
+                            self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][channel_updated]["Preset"] = target_preset #Update config to record new channel state
+                            LOG.debug("Updated", self.cfg[CONF_AREA][area_updated]["name"], "Channel Preset", self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][channel_updated])
+                            target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(self.cfg[CONF_AREA][area_updated][CONF_NAME]) #Find On, Off and Warm presets
                             button_found = False
                             for button_json in self.hb_cfg: #Update Homebridge to show state of any channel-specific button in the updated area
-                                if button_json["name"] == self.cfg[CONF_AREA][area_updated][CONF_NAME] and button_json["service_name"] == self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel_updated)][CONF_NAME]:
-                                    button_found = True
-                                    pb_parsed_json = {}
-                                    pb_parsed_json["name"] = button_json["name"]
-                                    pb_parsed_json["service_name"] = button_json["service_name"]
-                                    pb_parsed_json["characteristic"] = "On"
-                                    if str(target_preset) == off_preset:
+                                if button_json["name"] == self.cfg[CONF_AREA][area_updated][CONF_NAME]:
+                                    if button_json["service_name"] == self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel_updated)][CONF_NAME]:
+                                        button_found = True
+                                        pb_parsed_json = {}
+                                        pb_parsed_json["name"] = button_json["name"]
+                                        pb_parsed_json["service_name"] = button_json["service_name"]
+                                        pb_parsed_json["characteristic"] = "On"
+                                        if str(target_preset) == off_preset:
+                                            pb_parsed_json["value"] = False
+                                            button_state = "Off"
+                                            LOG.debug("Update Area " + button_json["name"] + "'s Homebridge " + button_json["service_name"] + " button to " + button_state)
+                                            self.outgoing_mqtt(pb_parsed_json)
+                                        elif str(target_preset) == on_preset or str(target_preset) == warm_preset:
+                                            pb_parsed_json["value"] = True
+                                            button_state = "On"
+                                            LOG.debug("Update Area " + button_json["name"] + "'s Homebridge " + button_json["service_name"] + " button to " + button_state)
+                                            self.outgoing_mqtt(pb_parsed_json)
+                                        else:
+                                            LOG.info("Neither On, Off nor Warm presets selected")
+                                        LOG.debug("Matching Linked Area")
+                                        self.match_linked_area(area_updated, off_preset, on_preset)
+                                    all_channels_off = True #Set Area HB button state if all channels are either on or off
+                                    all_channels_on = True
+                                    for channel in self.cfg[CONF_AREA][area_updated][CONF_CHANNEL]:
+                                        LOG.debug("Channel " + str(channel) + " Preset " + str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][channel]["Preset"]))
+                                        if str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][channel]["Preset"]) != off_preset:
+                                            all_channels_off = False
+                                        if str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][channel]["Preset"]) != on_preset:
+                                            all_channels_on = False
+                                    if all_channels_off: # Set area HB button to off if all channels are off
+                                        pb_parsed_json = {}
+                                        pb_parsed_json["name"] = button_json["name"]
+                                        pb_parsed_json["service_name"] = button_json["name"]
+                                        pb_parsed_json["characteristic"] = "On"
                                         pb_parsed_json["value"] = False
-                                        button_state = "Off"
-                                        LOG.debug("Update Area " + button_json["name"] + "'s Homebridge " + button_json["service_name"] + " button to " + button_state)
                                         self.outgoing_mqtt(pb_parsed_json)
-                                    elif str(target_preset) == on_preset or str(target_preset) == warm_preset:
-                                        pb_parsed_json["value"] = True
-                                        button_state = "On"
-                                        LOG.debug("Update Area " + button_json["name"] + "'s Homebridge " + button_json["service_name"] + " button to " + button_state)
+                                    elif all_channels_on: # Set area HB button to on if all channels are on
+                                        pb_parsed_json = {}
+                                        pb_parsed_json["name"] = button_json["name"]
+                                        pb_parsed_json["service_name"] = button_json["name"]
+                                        pb_parsed_json["characteristic"] = "On"
+                                        pb_parsed_json["value"] =True
                                         self.outgoing_mqtt(pb_parsed_json)
-                                    else:
-                                        print("Neither On, Off or Warm presets selected")
                             if not button_found:
-                               LOG.debug("No button found for Area Name: " + self.cfg[CONF_AREA][area_updated][CONF_NAME] + " Channel Name: " + self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel_updated)][CONF_NAME]) 
+                               LOG.debug("No Homebridge button found for Area Name: " + self.cfg[CONF_AREA][area_updated][CONF_NAME] + " Channel Name: " + self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel_updated)][CONF_NAME]) 
                         else:
                             LOG.debug("No preset set in channel update")
                     else:
@@ -179,11 +258,74 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                 else:
                     LOG.debug("No Channel updated")
             else:
-                LOG.debug("No channel is defined in config for Area " + str(area_updated))
+                LOG.debug("No channel is defined in config for Area " + str(area_updated) + " " + self.cfg[CONF_AREA][area_updated][CONF_NAME])
         else:
-            LOG.debug("Area not found in config")
+            LOG.info("Area not found in config")
             
-    def update_hb_preset(self, event_data): #Update an area's Homebridge button's state to match the state of its area's preset state
+    def match_channel_presets(self, area, preset): #Match an area's channel presets and its channels' Homebridge button states to the area's preset state
+        target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(self.cfg[CONF_AREA][area][CONF_NAME])
+        hb_button_json = {} # Find relevant homebridge buttons for the area that's been preset
+        for button_json in self.hb_cfg:
+            if button_json["name"] == self.cfg[CONF_AREA][area][CONF_NAME]:
+                hb_button_json = button_json
+        if CONF_CHANNEL in self.cfg[CONF_AREA][area]:
+            for channel in self.cfg[CONF_AREA][area][CONF_CHANNEL]: #Update Channel Presets to reflect new area preset
+                LOG.debug("Old Channel Preset. Area: " + str(area) + " Channel: " + str(channel) + " Preset: " + str(self.cfg[CONF_AREA][area][CONF_CHANNEL][channel]["Preset"]))
+                self.cfg[CONF_AREA][area][CONF_CHANNEL][channel]["Preset"] = str(preset)
+                LOG.debug("New Channel Preset. Area: " + str(area) + " Channel: " + str(channel) + " Preset: " + str(self.cfg[CONF_AREA][area][CONF_CHANNEL][channel]["Preset"]))
+                if hb_button_json != {}: # Update the channel homebridge buttons (if present)
+                    if hb_button_json["service_name"] == self.cfg[CONF_AREA][area][CONF_CHANNEL][str(channel)][CONF_NAME]:
+                        button_found = True
+                        pb_parsed_json = {}
+                        pb_parsed_json["name"] = hb_button_json["name"]
+                        pb_parsed_json["service_name"] = hb_button_json["service_name"]
+                        pb_parsed_json["characteristic"] = "On"
+                        if str(preset) == off_preset:
+                            pb_parsed_json["value"] = False
+                            button_state = "Off"
+                            LOG.debug("Update Area " + hb_button_json["name"] + "'s Homebridge " + hb_button_json["service_name"] + " button to " + button_state)
+                            self.outgoing_mqtt(pb_parsed_json)
+                        elif str(preset) == on_preset or str(preset) == warm_preset:
+                            pb_parsed_json["value"] = True
+                            button_state = "On"
+                            LOG.debug("Update Area " + hb_button_json["name"] + "'s Homebridge " + hb_button_json["service_name"] + " button to " + button_state)
+                            self.outgoing_mqtt(pb_parsed_json)
+                        else:
+                            LOG.info("Neither On, Off nor Warm presets selected")
+                
+    def match_linked_hb_channels(self, area_updated, light_state): # Match Homebridge Light buttons and Dynalite states for Linked Channels.
+        if "Linked" in self.cfg[CONF_AREA][area_updated]:
+            LOG.debug("Linked " + str(self.cfg[CONF_AREA][area_updated]))
+            if self.cfg[CONF_AREA][area_updated]["Linked"]["Master"]: # If it's the Master Area, update the Slave Area's Dynalite setting and HB button
+                pbl_parsed_json = {}
+                pbl_parsed_json["characteristic"] = "On"
+                pbl_parsed_json["name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
+                pbl_parsed_json["service_name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
+                pbl_parsed_json["value"] = light_state
+                LOG.debug("Operate Light 1 " + str(pbl_parsed_json))
+                pb_parsed_json = self.operate_light(pbl_parsed_json, switch_entire_area=True, match_linked_area=False)
+                LOG.debug("HB1 Message " + str(pbl_parsed_json))
+                self.outgoing_mqtt(pbl_parsed_json)
+                for channel in self.cfg[CONF_AREA][area_updated]["Linked"]["Channels"]: # Update the Master Area's HB channel buttons
+                    pbl1_parsed_json = {}
+                    pbl1_parsed_json["characteristic"] = "On"
+                    pbl1_parsed_json["name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
+                    pbl1_parsed_json["service_name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_CHANNEL][str(channel)][CONF_NAME]
+                    pbl1_parsed_json["value"] = light_state
+                    LOG.debug("HB2 Message " + str(pbl1_parsed_json))
+                    self.outgoing_mqtt(pbl1_parsed_json)  
+            else: # If it's the Slave Area, update the Master Area's Dynalite Channel and HB settings
+                for channel in self.cfg[CONF_AREA][area_updated]["Linked"]["Channels"]:
+                    pbl2_parsed_json = {}
+                    pbl2_parsed_json["characteristic"] = "On"
+                    pbl2_parsed_json["name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
+                    pbl2_parsed_json["service_name"] =self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_CHANNEL][str(channel)][CONF_NAME]
+                    pbl2_parsed_json["value"] = light_state
+                    pb_parsed_json = self.operate_light(pbl2_parsed_json, switch_entire_area=False, match_linked_area=False)
+                    LOG.debug("HB3 Message " + str(pbl2_parsed_json))
+                    self.outgoing_mqtt(pbl2_parsed_json)  
+        
+    def update_hb_preset(self, event_data): #Update an area's Homebridge button's state to match the state of its Dynalite area's preset state
         LOG.debug("Update HB Preset " + str(event_data))
         area_updated = None
         for area in self.cfg[CONF_AREA]: #Find area and preset that's been updated and capture its new state
@@ -198,8 +340,11 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                     for preset in self.cfg[CONF_AREA][area][CONF_PRESET]:
                         if preset == str(preset_updated): #Update config to reflect new states
                             self.cfg[CONF_AREA][area][CONF_PRESET][preset]["state"] = updated_state
+                        else:
+                            self.cfg[CONF_AREA][area][CONF_PRESET][preset]["state"] = other_states
+                    self.match_channel_presets(area_updated, preset_updated)                          
                 else:
-                    print("Preset not found in config. Area:", area_updated, "Preset:", preset_updated)
+                    LOG.info("Preset not found in config. Area: " + str(area_updated) + " Preset: " + str(preset_updated))
                     return
         if area_updated != None:
             pb_parsed_json = {}
@@ -210,7 +355,6 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
             if "Light" in self.cfg[CONF_AREA][area_updated][CONF_NAME]:
                 hb_service_found = True
                 target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(self.cfg[CONF_AREA][area_updated][CONF_NAME])
-                pb_parsed_json["characteristic"] = "On"
                 if warm_preset != None:
                     pb_parsed_json_warm = {}
                     pb_parsed_json_warm["name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
@@ -228,12 +372,15 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                         self.outgoing_mqtt(pb_parsed_json_warm)
                     else:
                         pb_parsed_json["value"] = False
+                    self.outgoing_mqtt(pb_parsed_json)
                 else:
-                    pb_parsed_json["value"] = False
+                    light_state = False
                     if str(preset_updated) != off_preset: #Update Homebridge without catering for a warm preset if the light's not cct
                         if updated_state == "ON":
-                            pb_parsed_json["value"] = True
-                self.outgoing_mqtt(pb_parsed_json) #Publish non-warm light Homebridge message
+                            light_state = True
+                    pb_parsed_json["value"] = light_state
+                    self.outgoing_mqtt(pb_parsed_json) #Publish non-cct light Homebridge message
+                    self.match_linked_hb_channels(area_updated, light_state) # Match Homebridge Light buttons and Dynalite states for Linked Channels                 
             elif "Window" in self.cfg[CONF_AREA][area_updated][CONF_NAME]:
                 hb_service_found = True
                 LOG.debug("Window")
@@ -244,14 +391,12 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                     hb_open_value = 0
                 pb_parsed_json["characteristic"] = "TargetPosition"
                 pb_parsed_json["value"] = hb_open_value
-                #print(pb_parsed_json)
                 self.outgoing_mqtt(pb_parsed_json)
                 pb_parsed_json1 = {}
                 pb_parsed_json1["name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
                 pb_parsed_json1["service_name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
                 pb_parsed_json1["characteristic"] = "CurrentPosition"
                 pb_parsed_json1["value"] = hb_open_value
-                #print(pb_parsed_json1)
                 self.outgoing_mqtt(pb_parsed_json1)
             elif "Shutters" in self.cfg[CONF_AREA][area_updated][CONF_NAME]:
                 hb_service_found = True
@@ -263,18 +408,16 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                     hb_open_value = 0
                 pb_parsed_json["characteristic"] = "TargetPosition"
                 pb_parsed_json["value"] = hb_open_value
-                #print(pb_parsed_json)
                 self.outgoing_mqtt(pb_parsed_json)
                 pb_parsed_json1 = {}
                 pb_parsed_json1["name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
                 pb_parsed_json1["service_name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
                 pb_parsed_json1["characteristic"] = "CurrentPosition"
                 pb_parsed_json1["value"] = hb_open_value
-                #print(pb_parsed_json1)
                 self.outgoing_mqtt(pb_parsed_json1)
-            elif "Good Morning" in self.cfg[CONF_AREA][area_updated][CONF_NAME]: #This is a special that uses a dynalite "Good Morning" button to open blinds that respond to the hb_incoming topic
+            elif "Good Morning" in self.cfg[CONF_AREA][area_updated][CONF_NAME]: #This is a special that uses a dynalite "Good Morning" button to open Main Bedroom shades that respond to the hb_incoming topic
                 hb_service_found = True
-                print ("Good Morning Pressed")
+                LOG.info("Main Bedroom Good Morning Pressed")
                 pb_parsed_json = {}
                 pb_parsed_json["name"] = "Main Room Shades"
                 pb_parsed_json["service_name"] = "Day Fresh"
@@ -298,17 +441,17 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                             pb_parsed_json["value"] = False
                         self.outgoing_mqtt(pb_parsed_json)               
             if not hb_service_found:
-                print("Homebridge Service not found for Area: " + self.cfg[CONF_AREA][area_updated][CONF_NAME])    
+                LOG.info("Homebridge Service not found for Area: " + self.cfg[CONF_AREA][area_updated][CONF_NAME])    
             LOG.debug("New States " + str(self.cfg[CONF_AREA][area_updated]))
         else:
-            print("Updated Area not found in config " + str(event_data))
+            LOG.info("Updated Area not found in config " + str(event_data))
                     
-    def operate_window(self, parsed_json):
+    def operate_window(self, parsed_json): #Respond to a Homebridge operate window button
         target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(parsed_json["name"])
         LOG.debug("Operating " + parsed_json["name"])
         LOG.debug("Target Area: " + str(target_area) + " Off Preset: " + str(off_preset) + " On Preset: " + str(on_preset) + " Warm Preset: " + str(warm_preset))
         if target_area == None or on_preset == None or off_preset == None:
-            print(parsed_json["name"] + " and/or its presets not found in config")
+            LOG.info(parsed_json["name"] + " and/or its presets not found in config")
             return None
         else:
             if parsed_json["value"] == 0:
@@ -319,7 +462,7 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                 target_preset = on_preset
                 non_target_preset = off_preset
                 window_action = "opening"
-        print(parsed_json["name"] + " " + window_action + ". Area " + str(target_area) + ", Preset " + target_preset)
+        LOG.info(parsed_json["name"] + " " + window_action + ". Area " + str(target_area) + ", Preset " + target_preset)
         self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset))
         self.cfg[CONF_AREA][int(target_area)][CONF_PRESET][str(target_preset)]["state"] = "On"
         self.cfg[CONF_AREA][int(target_area)][CONF_PRESET][str(non_target_preset)]["state"] = "Off"
@@ -328,14 +471,14 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
         pb_parsed_json["service_name"] = parsed_json["service_name"]
         pb_parsed_json["characteristic"] = "CurrentPosition"
         pb_parsed_json["value"] = parsed_json["value"]
-        return pb_parsed_json
+        return pb_parsed_json #Return a parsed_json that shows the window's post-command postion
     
-    def operate_switch(self, parsed_json):
+    def operate_switch(self, parsed_json): #Respond to a Homebridge operate switch button
         target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(parsed_json["name"])
         LOG.debug("Operating " + parsed_json["name"])
         LOG.debug("Target Area: " + str(target_area) + " Off Preset: " + str(off_preset) + " On Preset: " + str(on_preset) + " Warm Preset: " + str(warm_preset))
         if target_area == None or on_preset == None or off_preset == None:
-            print(parsed_json["name"] + " and/or its presets not found in config")
+            LOG.info(parsed_json["name"] + " and/or its presets not found in config")
             return {}
         else:
             if parsed_json["value"] == 0:
@@ -346,18 +489,18 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                 target_preset = on_preset
                 non_target_preset = off_preset
                 switch_action = "turning on"
-        print(parsed_json["name"] + " " + switch_action + ". Area " + str(target_area) + ", Preset " + target_preset)
+        LOG.info(parsed_json["name"] + " " + switch_action + ". Area " + str(target_area) + ", Preset " + target_preset)
         self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset))
         self.cfg[CONF_AREA][int(target_area)][CONF_PRESET][str(target_preset)]["state"] = "On"
         self.cfg[CONF_AREA][int(target_area)][CONF_PRESET][str(non_target_preset)]["state"] = "Off"
         return {}
     
-    def operate_light(self, parsed_json):
+    def operate_light(self, parsed_json, switch_entire_area=False, match_linked_area=True): #Respond to a Homebridge operate light button when match_linked_area is True and set linked lights when matched_linked_area is False
         target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(parsed_json["name"])
         LOG.debug("Operating " + parsed_json["service_name"])
         LOG.debug("Target Area: " + str(target_area) + " Off Preset: " + str(off_preset) + " On Preset: " + str(on_preset) + " Warm Preset: " + str(warm_preset))
         if target_area != None and on_preset != None and off_preset != None:
-            if parsed_json["name"] == parsed_json["service_name"]: #Unequal when operating a light within an area
+            if parsed_json["name"] == parsed_json["service_name"]: # Unequal when operating a light within an area
                 operate_entire_area = True
                 if "cct" in self.cfg[CONF_AREA][target_area]:
                     cct = True
@@ -365,22 +508,22 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                     cct = False
             else:
                 operate_entire_area = False
-                target_one_channel = self.identify_target_channel(int(target_area), parsed_json["service_name"])
+                target_one_channel = self.identify_target_channel(int(target_area), parsed_json["service_name"]) #Find the target channel
                 if target_one_channel == None:
-                    print(parsed_json["service_name"] + " not found in config")
+                    LOG.info(parsed_json["service_name"] + " not found in config")
                     return {}
                 if "cct" in self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]:
                     cct = True
                 else:
                     cct = False
-            if parsed_json["characteristic"] == "On":
+            if parsed_json["characteristic"] == "On": #If the light is being switched, without changing it's dimming level
                 hb_brightness = self.cfg[CONF_AREA][target_area]["level"]
                 if operate_entire_area:
-                    if parsed_json["value"] and not cct:
+                    if parsed_json["value"] and not cct: #Only cater for on state if the light isn't cct
                         target_preset = on_preset
                         non_target_presets = self.identify_non_target_presets(target_area, target_preset)
                         non_cct_light_action = "turning on"
-                    elif parsed_json["value"] and cct:
+                    elif parsed_json["value"] and cct: #Use use the light's cct state in cfg to determine whether it should be warm or cool when turned on
                         if self.cfg[CONF_AREA][target_area]["cct"] == "Warm":
                             target_preset = warm_preset
                             non_target_presets = self.identify_non_target_presets(target_area, target_preset)
@@ -393,21 +536,21 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                             non_cct_light_action = "turning on"
                             cct_light_action = "setting to cool"
                             self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset)) # Set to cool before setting level
-                    else:
+                    else: #Set to off
                         target_preset = off_preset
                         non_target_presets = self.identify_non_target_presets(target_area, target_preset)
                         non_cct_light_action = "turning off"
                         cct_light_action = "turning off"
                         hb_brightness = 0
                     target_channels = self.identify_area_channels(target_area)
-                    if target_channels != []:
+                    if target_channels != [] and not switch_entire_area: #Switch individual channels
                         for target_channel in target_channels:
                             if "cct" in self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)]:
                                 light_action = cct_light_action
                             else:
                                 light_action = non_cct_light_action
                             LOG.debug("Targeted Channel: " + str(target_channel))
-                            print(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
+                            LOG.info(parsed_json["name"] + " " + self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
                             self.dyn.devices[CONF_AREA][target_area].channel[target_channel].turnOn(brightness=hb_brightness)
                             for button_json in self.hb_cfg:
                                 if button_json["name"] == self.cfg[CONF_AREA][target_area][CONF_NAME] and button_json["service_name"] == self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME]:
@@ -424,19 +567,33 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                     if non_target_presets != []:
                         for preset in non_target_presets:
                             self.cfg[CONF_AREA][target_area][CONF_PRESET][str(preset)]["state"] = "Off"
-                    if target_preset == off_preset:
-                        self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset))                       
+                    self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset)) # Set area preset
+                    if match_linked_area: #Prevents recursive loops
+                        self.match_channel_presets(target_area, target_preset)
+                        if target_preset == off_preset:
+                            light_state = False
+                        else:
+                            light_state = True
+                        LOG.debug("Calling match_linked_hb_channels " + str(target_area) + " " + str(light_state))
+                        self.match_linked_hb_channels(target_area, light_state)
                 else:
                     if parsed_json["value"]:
                         hb_brightness = self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]["level"]
-                        #hb_brightness = 1
                         light_action = "turning on"
+                        channel_preset = on_preset
                     else:
                         hb_brightness = 0
                         light_action = "turning off"
-                    LOG.debug("Targeted Channel: " + target_one_channel)
-                    print(parsed_json["service_name"] + " " + light_action + ". Area " + str(target_area) + ", Channel " + target_one_channel)
+                        channel_preset = off_preset
+                    LOG.debug("Old Channel Preset. Area: " + str(target_area) + " Channel: " + str(target_one_channel) + " Preset: " + str(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]["Preset"]))
+                    self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]["Preset"] = str(channel_preset)
+                    LOG.debug("New Channel Preset. Area: " + str(target_area) + " Channel: " + str(target_one_channel) + " Preset: " + str(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]["Preset"]))
+                    LOG.debug("Targeted Channel: " + str(target_one_channel))
+                    LOG.info(parsed_json["name"] + " " + parsed_json["service_name"] + " " + light_action + ". Area " + str(target_area) + ", Channel " + target_one_channel)
                     self.dyn.devices[CONF_AREA][target_area].channel[int(target_one_channel)].turnOn(brightness=hb_brightness)
+                    if match_linked_area: #Prevents recursive loops by only calling match_linked_area when operating the primary area
+                        LOG.debug("Calling match_linked_area " + str(target_area) + " " + str(off_preset) + " " + str(on_preset))
+                        self.match_linked_area(target_area, off_preset, on_preset)
             elif parsed_json["characteristic"] == "Brightness":
                 hb_brightness = parsed_json["value"]/100
                 light_action = "brightness changing to "
@@ -445,12 +602,12 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                     if target_channels != []:
                         for target_channel in target_channels:
                             LOG.debug("Targeted Channel: " + str(target_channel))
-                            print(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + light_action + str(parsed_json["value"]) + "%. Area " + str(target_area) + ", Channel " + str(target_channel))
+                            LOG.info(parsed_json["name"] + " " + self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + light_action + str(parsed_json["value"]) + "%. Area " + str(target_area) + ", Channel " + str(target_channel))
                             self.dyn.devices[CONF_AREA][target_area].channel[target_channel].turnOn(brightness=hb_brightness)
                             self.cfg[CONF_AREA][target_area]["level"] = hb_brightness
                             self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)]["level"] = hb_brightness
                 else:
-                    print(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel][CONF_NAME] + " " + light_action + str(parsed_json["value"]) + "%. Area " + str(target_area) + ", Channel " + target_one_channel)
+                    LOG.info(parsed_json["name"] + " " + self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel][CONF_NAME] + " " + light_action + str(parsed_json["value"]) + "%. Area " + str(target_area) + ", Channel " + target_one_channel)
                     self.dyn.devices[CONF_AREA][target_area].channel[int(target_one_channel)].turnOn(brightness=hb_brightness)
                     self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]["level"] = hb_brightness
             elif parsed_json["characteristic"] == "ColorTemperature":
@@ -484,13 +641,13 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                             self.cfg[CONF_AREA][target_area][CONF_PRESET][warm_preset]["state"] = "On"
                             self.cfg[CONF_AREA][target_area][CONF_PRESET][on_preset]["state"] = "Off"
                     if drive_cct_change: #Change preset if a change is flagged and set brightness to previously set level
-                        print("Setting Area Preset " + target_preset)
+                        LOG.debug("Setting Area Preset " + target_preset)
                         self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset))
                         target_channels = self.identify_area_channels(target_area) #List the channels in the area
                         if not operate_entire_area:
                             target_one_channel = self.identify_target_channel(int(target_area), parsed_json["service_name"])
                             if target_one_channel == None:
-                                print(parsed_json["service_name"] + " channel not found in config when trying to set its colour temperature")
+                                LOG.info(parsed_json["name"] + " " + parsed_json["service_name"] + " channel not found in config when trying to set its colour temperature")
                                 return {}
                         if target_channels != []:
                             for target_channel in target_channels:
@@ -498,35 +655,34 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                                 if operate_entire_area:
                                     hb_brightness = self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)]["level"]
                                     if str(target_channel) in non_cct_channels:
-                                        print(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + non_cct_light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
+                                        LOG.info(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + non_cct_light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
                                     else:
-                                        print(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + cct_light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
+                                        LOG.info(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + cct_light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
                                 elif target_channel == int(target_one_channel):
                                     hb_brightness = self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)]["level"]
-                                    print(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + cct_light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
+                                    LOG.info(parsed_json["name"] + " " + self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + cct_light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
                                 else:
                                     LOG.debug("Neither Entire Area nor Target Channel" + " " + cct_light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
                                     hb_brightness = 0
                                 self.dyn.devices[CONF_AREA][target_area].channel[target_channel].turnOn(brightness=hb_brightness)
             else:
-                print("No valid light characteristic")
+                LOG.info("No valid light characteristic")
             return {}       
         else:
-            print(parsed_json["name"] + " and/or its presets not found in config")
+            LOG.info(parsed_json["name"] + " and/or its presets not found in config")
         return {}
 
 def handleEvent(event=None, dynalite=None):
     event_json = json.loads(event.toJson())
     if event_json["eventType"] == "CHANNEL" and event_json["direction"] == "IN":
         hbmqtt.update_hb_channel(event_json["data"])
-        #print(event_json["data"])
+        LOG.debug("Channel Event " + str(event_json["data"]))
     elif event_json["eventType"] == "PRESET" and event_json["direction"] == "IN":
         hbmqtt.update_hb_preset(event_json["data"])
-        #print(event_json["data"])
-    LOG.debug(event.toJson())
+        LOG.debug("Preset Event " + str(event_json["data"]))
 
 def handleConnect(event=None, dynalite=None):
-    print("Connected to Dynalite")
+    LOG.debug("Connected to Dynalite")
     hbmqtt.in_message(test_mode=None) #Use for testing via console. Starts console input async task loop. Use test_mode="Area Preset" for testing area presets, test_mode="Channel Level" for testing channel levels or test_mode=None to disable.
     hbmqtt.incoming_mqtt() #Start Homebridge incoming mqtt async task loop
     
@@ -537,64 +693,71 @@ if __name__ == '__main__':
     #   "channel" records the details of each required channel in a dictionary, referenced by a number string that equates to the channel number
     #      "name" records the name of that channel
     #      "level" records the brightness level of that channel
+    #		"Preset" records the current preset of that channel
     #      "cct" records the color temperature (using Homebridge's scale" for channels that have cct lights
     #   "preset" records the area's preset details in a dictionary, referenced by a string number that equates to the preset's number
     #      "name" records the name of the preset. Can be "Off", "Med", "Low" or "Warm".
     #      "state" records the state of that preset. Initialises with "" and can be set to "On" or "Off" 
     #   "level" for the area records the brightness level of that area for lights or the opened/closed on/off states of windows and switches
+    #	 "Linked": maps the area to anoher area that is linked in Dynalite's configuration (e.g. there are Antumbra buttons that control an area containing channels that are a subset of another area)
+    #		"Area" records the area number of the linked area
+    #		"Channels" records a list of the channels that are linked to the other area
+    #		"Master" set to True if the area is a Master area (i.e. contains the superset of channels) or set to False if it's Slave area (i.e. contains the subset of channels)
     
-    cfg = {"area": {3: {"name": "Entry Light", "channel": {"1": {"name": "Ceiling Light", "level": 1, "cct": 140}, "2": {"name": "Wall Light", "level": 1}}, "preset": {"1": {"name": "Med", "state": ""}, "2": {"name":"On", "state": ""},
+    cfg = {"area": {3: {"name": "Entry Light", "channel": {"1": {"name": "Ceiling Light", "level": 1, "Preset": "", "cct": 140}, "2": {"name": "Wall Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "Med", "state": ""}, "2": {"name":"On", "state": ""},
                                                                                                                                     "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}, "7": {"name": "Warm", "state": ""}},
                         "level": 1, "cct": 140},
-                    4: {"name": "Comms Light", "channel": {"1": {"name": "Comms Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""}, "3": {"name":"Low", "state": ""},
+                    4: {"name": "Comms Light", "channel": {"1": {"name": "Comms Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""}, "3": {"name":"Low", "state": ""},
                                                                                                                       "4": {"name": "Off", "state": ""}}, "level": 1},
-                    5: {"name": "Powder Light", "channel": {"1": {"name": "Ceiling Light", "level": 1}, "2": {"name": "Vanity Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
+                    5: {"name": "Powder Light", "channel": {"1": {"name": "Ceiling Light", "level": 1, "Preset": ""}, "2": {"name": "Vanity Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
                                                                                                                                                                      "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    6: {"name": "Kitchen Light", "channel": {"1": {"name": "Kitchen Hallway Light", "level": 1, "cct": 140}, "2": {"name": "Kitchen Downlights", "level": 1, "cct": 140}, "3": {"name": "Kitchen Pendant Light", "level": 1},
-                                                             "5": {"name": "Kitchen Ceiling Light", "level": 1, "cct": 140}, "6": {"name": "Kitchen Cooktop Light", "level": 1}},
-                        "preset": {"1": {"name": "Med", "state": ""}, "2": {"name":"On", "state": ""}, "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}, "7": {"name": "Warm", "state": ""}}, "level": 1, "cct": 140},
-                    7: {"name": "Appliance Light", "channel": {"4": {"name": "Appliance Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""}, "3": {"name":"Low", "state": ""},
+                    6: {"name": "Kitchen Light", "channel": {"1": {"name": "Kitchen Hallway Light", "level": 1, "Preset": "", "cct": 140}, "2": {"name": "Kitchen Downlights", "level": 1, "Preset": "", "cct": 140}, "3": {"name": "Kitchen Pendant Light", "level": 1, "Preset": ""},
+                                                             "5": {"name": "Kitchen Ceiling Light", "level": 1, "Preset": "", "cct": 140}, "6": {"name": "Kitchen Cooktop Light", "level": 1, "Preset": ""}},
+                        "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""}, "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}, "7": {"name": "Warm", "state": ""}}, "level": 1, "cct": 140, "Linked": {"Area": 23, "Channels": [2, 3], "Master": True}},
+                    7: {"name": "Appliance Light", "channel": {"4": {"name": "Appliance Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""}, "3": {"name":"Low", "state": ""},
                                                                                                                       "4": {"name": "Off", "state": ""}}, "level": 1},
-                    8: {"name": "Living Light", "channel": {"1": {"name": "Living Light", "level": 1, "cct": 140}}, "preset": {"1": {"name": "Low", "state": ""}, "2": {"name":"On", "state": ""}, "3": {"name":"Med", "state": ""},
+                    8: {"name": "Living Light", "channel": {"1": {"name": "Living Light", "level": 1, "Preset": "", "cct": 140}}, "preset": {"1": {"name": "Low", "state": ""}, "2": {"name":"On", "state": ""}, "3": {"name":"Med", "state": ""},
                                                                                                                        "4": {"name": "Off", "state": ""}, "6": {"name": "Warm", "state": ""}}, "level": 1, "cct": 140},
-                    9: {"name": "Dining Light", "channel": {"3": {"name": "TV Light", "level": 1}, "4": {"name": "Dining Pendant Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
+                    9: {"name": "Dining Light", "channel": {"3": {"name": "TV Light", "level": 1, "Preset": ""}, "4": {"name": "Dining Pendant Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
                                                                                                                                                                         "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    10: {"name": "Main Light", "channel": {"1": {"name": "Entry Light", "level": 1}, "2": {"name": "Wall Light", "level": 1}, "3": {"name": "Pendant Light", "level": 1}, "4": {"name": "Ceiling Light", "level": 1},
-                                                           "5": {"name": "Left Bedside Light", "level": 1}, "6": {"name": "Right Bedside Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
-                                                                                                                                                                                "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    11: {"name": "Main Ensuite Light", "channel": {"1": {"name": "Main Ensuite Shower Light", "level": 1}, "2": {"name": "Main Ensuite Vanity Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
+                    10: {"name": "Main Light", "channel": {"1": {"name": "Entry Light", "level": 1, "Preset": ""}, "2": {"name": "Wall Light", "level": 1, "Preset": ""}, "3": {"name": "Pendant Light", "level": 1, "Preset": ""}, "4": {"name": "Ceiling Light", "level": 1, "Preset": ""},
+                                                           "5": {"name": "Left Bedside Light", "level": 1, "Preset": ""}, "6": {"name": "Right Bedside Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
+                                                                                                                                                                                "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1, "Linked": {"Area": 24, "Channels": [5, 6], "Master": True}},
+                    11: {"name": "Main Ensuite Light", "channel": {"1": {"name": "Main Ensuite Shower Light", "level": 1, "Preset": ""}, "2": {"name": "Main Ensuite Vanity Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
                                                                                                                                                                            "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    12: {"name": "Front Balcony Light", "channel": {"1": {"name": "North Balcony Light", "level": 1}, "2": {"name": "South Balcony Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""},
+                    12: {"name": "Front Balcony Light", "channel": {"1": {"name": "North Balcony Light", "level": 1, "Preset": ""}, "2": {"name": "South Balcony Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""},
                                                                                                                                                                                           "2": {"name":"Med", "state": ""},
                                                                                                                                                                                           "3": {"name":"Low", "state": ""},
                                                                                                                                                                                           "4": {"name": "Off", "state": ""}}, "level": 1},
-                    13: {"name": "Laundry Light", "channel": {"1": {"name": "Ceiling Light", "level": 1}, "2": {"name": "Benchtop Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
+                    13: {"name": "Laundry Light", "channel": {"1": {"name": "Ceiling Light", "level": 1, "Preset": ""}, "2": {"name": "Benchtop Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
                                                                                                                                                                          "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    14: {"name": "South Light",  "channel": {"1": {"name": "Pendant Light", "level": 1}, "2": {"name": "Ceiling Light", "level": 1}, "3": {"name": "Left Bedside Light", "level": 1},
-                                                             "4": {"name": "Right Bedside Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""}, "3": {"name":"Low", "state": ""},
-                                                                                                                              "4": {"name": "Off", "state": ""}}, "level": 1},
-                    15: {"name": "South Ensuite Light", "channel": {"1": {"name": "Ceiling Light", "level": 1}, "2": {"name": "Vanity Light", "level": 1}}, "preset": {"1": {"name": "On", "state": "", "state": ""},
+                    14: {"name": "South Light",  "channel": {"1": {"name": "Pendant Light", "level": 1, "Preset": ""}, "2": {"name": "Ceiling Light", "level": 1, "Preset": ""}, "3": {"name": "Left Bedside Light", "level": 1, "Preset": ""},
+                                                             "4": {"name": "Right Bedside Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""}, "3": {"name":"Low", "state": ""},
+                                                                                                                              "4": {"name": "Off", "state": ""}}, "level": 1, "Linked": {"Area": 26, "Channels": [3, 4], "Master": True}},
+                    15: {"name": "South Ensuite Light", "channel": {"1": {"name": "Ceiling Light", "level": 1, "Preset": ""}, "2": {"name": "Vanity Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": "", "state": ""},
                                                                                                                                                                              "2": {"name":"Med", "state": ""}, "3": {"name":"Low", "state": ""},
                                                                                                                                                                              "4": {"name": "Off", "state": ""}}, "level": 1},
-                    16: {"name": "South Robe Light", "channel": {"1": {"name": "Ceiling Light", "level": 1}, "2": {"name": "LED Strip Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
+                    16: {"name": "South Robe Light", "channel": {"1": {"name": "Ceiling Light", "level": 1, "Preset": ""}, "2": {"name": "LED Strip Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
                                                                                                                                                                              "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    17: {"name": "Rear Balcony Light", "channel": {"1": {"name": "Rear Balcony Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    18: {"name": "Study Light", "channel": {"1": {"name": "Pendant", "level": 1}, "2": {"name": "Ceiling LED", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
+                    17: {"name": "Rear Balcony Light", "channel": {"1": {"name": "Rear Balcony Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
+                    18: {"name": "Study Light", "channel": {"1": {"name": "Pendant", "level": 1, "Preset": ""}, "2": {"name": "Ceiling LED", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
                                                                                                                                                               "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    19: {"name": "North Light", "channel": {"1": {"name": "Desk Light", "level": 1}, "2": {"name": "Ceiling Light", "level": 1}, "3": {"name": "Pendant Light", "level": 1}, "4": {"name": "Left Bedside Light", "level": 1},
-                                                            "5": {"name": "Right Bedside Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name": "Med", "state": ""}, "3": {"name":"Low", "state": ""},
-                                                                                                                          "4": {"name": "Off", "state": ""}}, "level": 1},
-                    20: {"name": "North Ensuite Light", "channel": {"1": {"name": "Ceiling Light", "level": 1}, "2": {"name": "Vanity Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
+                    19: {"name": "North Light", "channel": {"1": {"name": "Desk Light", "level": 1, "Preset": ""}, "2": {"name": "Ceiling Light", "level": 1, "Preset": ""}, "3": {"name": "Pendant Light", "level": 1, "Preset": ""}, "4": {"name": "Left Bedside Light", "level": 1, "Preset": ""},
+                                                            "5": {"name": "Right Bedside Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name": "Med", "state": ""}, "3": {"name":"Low", "state": ""},
+                                                                                                                          "4": {"name": "Off", "state": ""}}, "level": 1, "Linked": {"Area": 25, "Channels": [4, 5], "Master": True}},
+                    20: {"name": "North Ensuite Light", "channel": {"1": {"name": "Ceiling Light", "level": 1, "Preset": ""}, "2": {"name": "Vanity Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
                                                                                                                                                                              "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    23: {"name": "Kitchen Economy Light", "channel": {"2": {"name": "Kitchen Downlights", "level": 1, "cct": 140}, "3": {"name": "Kitchen Pendant Light", "level": 1}}, "preset": {"9": {"name": "On", "state": ""}, "8": {"name": "Warm", "state": ""},
-                                                                                                                                                                                       "4": {"name": "Off", "state": ""}}, "level": 1, "cct": 140},
-                    24: {"name": "Main Bedside Lights", "channel": {"5": {"name": "Left Bedside Light", "level": 1}, "6": {"name": "Right Bedside Light", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    32: {"name": "Main Ensuite Towels", "channel": {"1": {"name": "Main Ensuite Towels", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    33: {"name": "Main Ensuite Floor", "channel": {"1": {"name": "Main Ensuite Floor", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    34: {"name": "South Ensuite Towels", "channel": {"1": {"name": "South Ensuite Towels", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    35: {"name": "South Ensuite Floor", "channel": {"1": {"name": "South Ensuite Floors", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    36: {"name": "North Ensuite Towels", "channel": {"1": {"name": "North Ensuite Towels", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    37: {"name": "North Ensuite Floor", "channel": {"1": {"name": "North Ensuite Floor", "level": 1}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
+                    23: {"name": "Kitchen Economy Light", "channel": {"2": {"name": "Kitchen Downlights", "level": 1, "Preset": "", "cct": 140}, "3": {"name": "Kitchen Pendant Light", "level": 1, "Preset": ""}}, "preset": {"9": {"name": "On", "state": ""}, "8": {"name": "Warm", "state": ""},
+                                                                                                                                                                                       "4": {"name": "Off", "state": ""}}, "level": 1, "cct": 140, "level": 1, "Linked": {"Area": 6, "Channels": [2, 3], "Master": False}},
+                    24: {"name": "Main Bedside Lights", "channel": {"5": {"name": "Left Bedside Light", "level": 1, "Preset": ""}, "6": {"name": "Right Bedside Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1, "Linked": {"Area": 10, "Channels": [5, 6], "Master": False}},
+                    25: {"name": "North Bedside Lights", "channel": {"4": {"name": "Left Bedside Light", "level": 1, "Preset": ""}, "5": {"name": "Right Bedside Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1, "Linked": {"Area": 19, "Channels": [4, 5], "Master": False}},
+                    26: {"name": "South Bedside Lights", "channel": {"3": {"name": "Left Bedside Light", "level": 1, "Preset": ""}, "4": {"name": "Right Bedside Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1, "Linked": {"Area": 14, "Channels": [3, 4], "Master": False}},
+                    32: {"name": "Main Ensuite Towels", "channel": {"1": {"name": "Main Ensuite Towels", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
+                    33: {"name": "Main Ensuite Floor", "channel": {"1": {"name": "Main Ensuite Floor", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
+                    34: {"name": "South Ensuite Towels", "channel": {"1": {"name": "South Ensuite Towels", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
+                    35: {"name": "South Ensuite Floor", "channel": {"1": {"name": "South Ensuite Floors", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
+                    36: {"name": "North Ensuite Towels", "channel": {"1": {"name": "North Ensuite Towels", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
+                    37: {"name": "North Ensuite Floor", "channel": {"1": {"name": "North Ensuite Floor", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
                     48: {"name": "Main Window", "preset": {"1": {"name": "Open", "state": ""}, "4": {"name": "Close", "state": ""}}, "level": 1},
                     49: {"name": "South Window", "preset": {"1": {"name": "Open", "state": ""}, "4": {"name": "Close", "state": ""}}, "level": 1},
                     59: {"name": "North Window", "preset": {"1": {"name": "Open", "state": ""}, "4": {"name": "Close", "state": ""}}, "level": 1},
@@ -603,7 +766,7 @@ if __name__ == '__main__':
                     142: {"name": "North Shutters", "preset": {"1": {"name": "Open", "state": ""}, "4": {"name": "Close", "state": ""}}, "level": 1},
                     143: {"name": "Main Ensuite Shutters", "preset": {"1": {"name": "Open", "state": ""}, "4": {"name": "Close", "state": ""}}, "level": 1},
                     148: {"name": "Main Good Morning", "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1}},
-           "host": "172.24.1.50", "port": 8008, "autodiscover": True, "log_level": "logging.INFO", "log_formatter": '"[%(asctime)s] %(name)s {%(filename)s:%(lineno)d} %(levelname)s - %(message)s"'}
+           "host": "<Your Dynalite Gateway IP Address>", "port": 8008, "autodiscover": True, "log_level": "logging.INFO", "log_formatter": '"[%(asctime)s] %(name)s {%(filename)s:%(lineno)d} %(levelname)s - %(message)s"'}
     
     #Set up the Homebridge config list to mirror how the Homebridge mqtt plug-in's accessories have been configured via Node-RED or the plug-in's homebridge/to/add and homebridge/to/add/service mqtt topics.
     #"name" is set to name of the dynalite area's name to be controlled by the respective button.
@@ -611,6 +774,8 @@ if __name__ == '__main__':
     hb_cfg = [{"name":"Living Light","service_name":"Living Light","service_type":"Lightbulb", "characteristics_properties": {"Brightness": {}, "ColorTemperature": {}}},
               {"name":"Kitchen Light","service_name":"Kitchen Light","service_type":"Lightbulb", "characteristics_properties": {"Brightness": {}, "ColorTemperature": {}}},
               {"name":"Kitchen Economy Light","service_name":"Kitchen Economy Light","service_type":"Lightbulb", "characteristics_properties": {"Brightness": {}, "ColorTemperature": {}}},
+              {"name":"Kitchen Light","service_name":"Kitchen Downlights","service_type":"Lightbulb", "characteristics_properties": {"Brightness": {}, "ColorTemperature": {}}},
+              {"name":"Kitchen Light","service_name":"Kitchen Hallway Light","service_type":"Lightbulb", "characteristics_properties": {"Brightness": {}, "ColorTemperature": {}}},
               {"name":"Kitchen Light","service_name":"Kitchen Ceiling Light","service_type":"Lightbulb", "characteristics_properties": {"Brightness": {}, "ColorTemperature": {}}},
               {"name":"Kitchen Light","service_name":"Kitchen Pendant Light","service_type":"Lightbulb", "characteristics_properties": {"Brightness": {}}},
               {"name":"Kitchen Light","service_name":"Kitchen Cooktop Light","service_type":"Lightbulb", "characteristics_properties": {"Brightness": {}}},
