@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#Northcliff Dynalite/Homebridge mqtt Bridge - Version 1.66_Gen
+#Northcliff Dynalite/Homebridge mqtt Bridge - Version 3.1 refactor 1 - Gen
 import json
 import logging
 import asyncio
@@ -21,64 +21,33 @@ dynalite = None
 
 class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
     def __init__(self, dyn=None, config=None, hb_config=None, loop=None):
+        from dynalite_controller_Gen import DynaliteController
+        from homebridge_adapter_Gen import HomebridgeAdapter
         self.dyn = dyn
         self.cfg = config
         self.hb_cfg = hb_config
         self.loop = loop
+        self.message_count = 0 # Set watchdog message count
+        self.watchdog_file_name = '/home/pi/Dyna_hb/watchdog.log'
         self.hb_incoming_mqtt_topic = "homebridge/from/set" #Topic for messages from the Homebridge mqtt plugin
         self.hb_outgoing_mqtt_topic = "homebridge/to/set" #Topic for messages to the Homebridge mqtt plugin
         self.hb_switch_functions = ["Towels", "Floor"]
-        
-    def identify_area_presets(self, area_name): #Return an area preset and its on/opened, off/closed and warm cct presets for a specified area's name
-        target_area = None
-        on_preset = None
-        off_preset = None
-        warm_preset = None
-        for area in self.cfg[CONF_AREA]:
-            if area_name == self.cfg[CONF_AREA][area][CONF_NAME]:
-                target_area = area
-                for preset in self.cfg[CONF_AREA][area][CONF_PRESET]:
-                    if self.cfg[CONF_AREA][area][CONF_PRESET][preset][CONF_NAME] == "On" or self.cfg[CONF_AREA][area][CONF_PRESET][preset][CONF_NAME] == "Open":
-                        on_preset = preset
-                    elif self.cfg[CONF_AREA][area][CONF_PRESET][preset][CONF_NAME] == "Off" or self.cfg[CONF_AREA][area][CONF_PRESET][preset][CONF_NAME] == "Close":
-                        off_preset = preset
-                    elif self.cfg[CONF_AREA][area][CONF_PRESET][preset][CONF_NAME] == "Warm":
-                        warm_preset = preset
-        return target_area, off_preset, on_preset, warm_preset
+        self.mqtt_out_queue = asyncio.Queue(maxsize=1000)
+        self.mqtt_client = None
+        self.controller = DynaliteController(
+            dyn=self.dyn,
+            cfg=self.cfg,
+            hb_cfg=self.hb_cfg,
+            outgoing_cb=self.outgoing_mqtt
+            )
+        self.hb_adapter = HomebridgeAdapter(self.controller)
+         
+    def in_message(self, test_mode=None): #Collect async console inputs for each of the test modes
+        if test_mode is not None:
+            self.safe_task(lambda: self._in_message(test_mode), "console_input")                      
     
-    def identify_area_channels(self, area): #Return a list of the channels within a specified area
-        target_channels = []
-        if CONF_CHANNEL in self.cfg[CONF_AREA][area]:
-            for channel in self.cfg[CONF_AREA][area][CONF_CHANNEL]:
-                target_channels.append(int(channel))
-        return target_channels
-    
-    def identify_target_channel(self, area, channel_name): #Return an area's channel number for a specified channel name within that area
-        target_channel = None
-        if CONF_CHANNEL in self.cfg[CONF_AREA][area]:
-            for channel in self.cfg[CONF_AREA][area][CONF_CHANNEL]:
-                if CONF_NAME in self.cfg[CONF_AREA][area][CONF_CHANNEL][channel]:
-                    for channel in self.cfg[CONF_AREA][area][CONF_CHANNEL]:
-                        if channel_name == self.cfg[CONF_AREA][area][CONF_CHANNEL][channel][CONF_NAME]:
-                            target_channel = channel
-        return target_channel
-    
-    def identify_non_target_presets(self, target_area, target_preset): #Return the list of presets that aren't targeted
-        non_target_presets = []
-        for area in self.cfg[CONF_AREA]:
-            if area == target_area:
-                for preset in self.cfg[CONF_AREA][area][CONF_PRESET]:
-                    if preset != target_preset:
-                        non_target_presets.append(preset)
-        return non_target_presets
-                            
-    def in_message(self, test_mode=None): #Create an async loop task when in console test mode
-        if test_mode != None:
-            self.loop.create_task(self._in_message(test_mode))
-        
-    async def _in_message(self, test_mode): #Collect async console inputs for each of the test modes
-        if test_mode != None:
-            while True:
+    async def _in_message(self, test_mode):
+        while True:
                 if test_mode == "Area Preset":
                     self.man_area = int(await aioconsole.ainput("Area"))
                     self.man_preset = int(await aioconsole.ainput("Preset"))
@@ -90,47 +59,42 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
                     self.dyn.devices[CONF_AREA][self.man_area].channel[self.man_channel].turnOn(brightness=self.man_level)
                 else:
                     pass
-            
-    def incoming_mqtt(self): #Create an async loop task for mqtt message capture
-        self.loop.create_task(self._incoming_mqtt())
         
     async def _incoming_mqtt(self): #Capture, filter and action relevant incoming Homebridge mqtt messages
-        async with aiomqtt.Client("<Your mqtt broker IP address>") as client:
-            async with client.messages() as messages:
-                await client.subscribe(self.hb_incoming_mqtt_topic)
-                async for message in messages:
-                    if message.topic.matches(self.hb_incoming_mqtt_topic): #Provide for monitoring of multiple mqtt topics
-                        LOG.debug("Do something with " + str(message.topic) + " " + str(message.payload))
-                        decoded_payload = str(message.payload.decode("utf-8"))
-                        parsed_json = json.loads(decoded_payload)
-                        pb_parsed_json = {}
-                        if "service_type" in parsed_json and "characteristic" in parsed_json and "name" in parsed_json:
-                            if parsed_json["service_type"] == "Window" and parsed_json["characteristic"] == "TargetPosition":
-                                LOG.debug("Operate Window: " + str(parsed_json))
-                                pb_parsed_json = self.operate_window(parsed_json)
-                            elif parsed_json["service_type"] == "Lightbulb":
-                                LOG.debug("Operate Light: " + str(parsed_json))
-                                pb_parsed_json = self.operate_light(parsed_json, switch_entire_area=False, match_linked_area=True)
-                            elif parsed_json["service_type"] == "Switch":
-                                LOG.debug("Operate Switch: " + str(parsed_json))
-                                pb_parsed_json = self.operate_switch(parsed_json)
-                            elif "Shutters" in parsed_json["name"] and parsed_json["characteristic"] == "TargetPosition":
-                                LOG.debug("Operate Shutters: " + str(parsed_json))
-                                pb_parsed_json = self.operate_window(parsed_json)
-                        if pb_parsed_json != {}: #Provides the ability to update Homebridge button states after operation (e.g. showing a window has been opened/closed)
-                            self.outgoing_mqtt(pb_parsed_json)
-                        if parsed_json["name"] == "Main Room Shades":
-                            if parsed_json["value"] == 0:
-                                #This is a special that uses a dynalite "Good Morning" button to open blinds that respond to the hb_incoming topic.
-                                #It resets the Good Morning button when any blind is closed
-                                LOG.info("Resetting Main Bedroom Good Morning button")
-                                self.dyn.devices[CONF_AREA][148].presetOn(4)
-                            elif parsed_json["value"] == 100:
-                                #This is a special that uses a dynalite "Good Morning" button to open blinds that respond to the hb_incoming topic.
-                                #It sets the Good Morning button when any Main Bedroom window shade is opened
-                                LOG.info("Setting Main Bedroom Good Morning button")
-                                self.dyn.devices[CONF_AREA][148].presetOn(1)
-    
+        while True:
+            try:
+                async with aiomqtt.Client("<Your mqtt Broker IP Address") as client:
+                    async with client.messages() as messages:
+                        await client.subscribe("#")
+                        LOG.info("Subscribed to %s", "#")                        
+                        async for message in messages:
+                            try:
+                                await self._handle_mqtt_message(message)
+                            except Exception:
+                                LOG.exception("MQTT message handler failed")
+            except asyncio.CancelledError:
+                raise
+            except aiomqtt.MqttError as e:
+                LOG.error("MQTT icoming connection lost: %s", e)
+                await asyncio.sleep(2)
+                            
+    async def _handle_mqtt_message(self, message):
+        self.message_count += 1
+        if self.message_count > 200: # Write to watchdog file every 200 mqtt messages
+            self.message_count = 0
+            with open(self.watchdog_file_name, 'w') as f:
+                f.write('dynapi script alive')
+        if message.topic.matches(self.hb_incoming_mqtt_topic): #Provide for monitoring of multiple mqtt topics
+            LOG.debug("Do something with " + str(message.topic) + " " + str(message.payload))
+            try:
+                parsed_json = json.loads(message.payload.decode("utf-8"))
+            except Exception as e:
+                LOG.warning("Invalid MQTT payload on %s: %r (%s)", message.topic, message.payload, e)
+                return
+            result = self.hb_adapter.handle_message(parsed_json)
+            if result: #Provides the ability to update Homebridge button states after operation (e.g. showing a window has been opened/closed)
+                self.outgoing_mqtt(result)
+            
     def check_valid_hb_message(self, pb_parsed_json): #Caters for situations where there's a Dynalite button that has no matching Homebridge button
         valid_message = False
         for button in self.hb_cfg:
@@ -139,552 +103,55 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
         if not valid_message:
             LOG.debug("Trying to set an invalid Homebridge Button. Message ignored. Name: " + pb_parsed_json["name"] + " Service Name: " + pb_parsed_json["service_name"])
         return valid_message
-                            
-    def outgoing_mqtt(self, pb_parsed_json, topic="homebridge/to/set"): #Create an async loop task to publish mqtt messages
-        if self.check_valid_hb_message(pb_parsed_json):
-            self.loop.create_task(self._outgoing_mqtt(pb_parsed_json, topic))
-    
-    async def _outgoing_mqtt(self, pb_parsed_json, topic): #Publish an mqtt message
-        async with aiomqtt.Client("studypi.local") as client:
-            await client.publish(topic, payload=json.dumps(pb_parsed_json))
-            
-    def match_linked_area(self, area_updated, off_preset, on_preset): # Match Slave Area Dynalite and HB button states for Linked Channels to the Master Area's states
-        if "Linked" in self.cfg[CONF_AREA][area_updated]:
-            LOG.debug("Linked Channel to Area Update " + str(self.cfg[CONF_AREA][area_updated]))
-            if self.cfg[CONF_AREA][area_updated]["Linked"]["Master"]:
-                all_linked_channels_on = True
-                all_linked_channels_off = True
-                for channel in self.cfg[CONF_AREA][area_updated]["Linked"]["Channels"]:
-                    LOG.debug("Channel " + str(channel) + " " + str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel)]["Preset"]))
-                    if str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel)]["Preset"]) != off_preset:
-                        all_linked_channels_off = False
-                    if str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel)]["Preset"]) != on_preset:
-                        all_linked_channels_on = False
-                LOG.debug("All Linked Channels Off " + str(all_linked_channels_off) + " All Linked Channels On " + str(all_linked_channels_on))
-                # Update Slave Area Dynalite and HB states if all linked Master Channels are either on or off
-                if all_linked_channels_on:
-                    pbln_parsed_json = {}
-                    pbln_parsed_json["characteristic"] = "On"
-                    pbln_parsed_json["name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
-                    pbln_parsed_json["service_name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
-                    pbln_parsed_json["value"] = True
-                    LOG.debug("All Linked Channels are On " + str(pbln_parsed_json))
-                    pb_parsed_json = self.operate_light(pbln_parsed_json, switch_entire_area=True, match_linked_area=False)
-                    LOG.debug("HB Linked Area Message " + str(pbln_parsed_json))
-                    self.outgoing_mqtt(pbln_parsed_json)
-                elif all_linked_channels_off:
-                    pblf_parsed_json = {}
-                    pblf_parsed_json["characteristic"] = "On"
-                    pblf_parsed_json["name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
-                    pblf_parsed_json["service_name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
-                    pblf_parsed_json["value"] = False
-                    LOG.debug("All Linked Channels are Off " + str(pblf_parsed_json))
-                    pb_parsed_json = self.operate_light(pblf_parsed_json, switch_entire_area=True, match_linked_area=False)
-                    LOG.debug("HB Linked Area Message " + str(pblf_parsed_json))
-                    self.outgoing_mqtt(pblf_parsed_json)
-            
-    def update_hb_channel(self, event_data): #Update a channel-specific Homebridge button's state to match the state of its area's preset. Match any linked area's dynalite state.
-        LOG.debug("Update HB Channel " + str(event_data))
-        area_updated = None
-        for area in self.cfg[CONF_AREA]: #Find area and preset that's been updated and capture its new state
-            if area == event_data[CONF_AREA]:
-                LOG.debug("Old area states " + str(self.cfg[CONF_AREA][area]))
-                area_updated = area
-        if area_updated != None:
-            channel_updated = None
-            if CONF_CHANNEL in self.cfg[CONF_AREA][area_updated]:
-                for channel in self.cfg[CONF_AREA][area_updated][CONF_CHANNEL]:
-                    if channel == str(event_data[CONF_CHANNEL]):
-                        channel_updated = channel
-                if channel_updated != None:
-                    if event_data["action"] == "cmd": #Only respond to Dynalite command messages
-                        LOG.debug("Update HB Channel " + str(event_data))
-                        if CONF_PRESET in event_data:
-                            target_preset = event_data[CONF_PRESET]
-                            self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][channel_updated]["Preset"] = target_preset #Update config to record new channel state
-                            LOG.debug("Updated", self.cfg[CONF_AREA][area_updated]["name"], "Channel Preset", self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][channel_updated])
-                            target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(self.cfg[CONF_AREA][area_updated][CONF_NAME]) #Find On, Off and Warm presets
-                            button_found = False
-                            for button_json in self.hb_cfg: #Update Homebridge to show state of any channel-specific button in the updated area
-                                if button_json["name"] == self.cfg[CONF_AREA][area_updated][CONF_NAME]:
-                                    if button_json["service_name"] == self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel_updated)][CONF_NAME]:
-                                        button_found = True
-                                        pb_parsed_json = {}
-                                        pb_parsed_json["name"] = button_json["name"]
-                                        pb_parsed_json["service_name"] = button_json["service_name"]
-                                        pb_parsed_json["characteristic"] = "On"
-                                        if str(target_preset) == off_preset:
-                                            pb_parsed_json["value"] = False
-                                            button_state = "Off"
-                                            LOG.debug("Update Area " + button_json["name"] + "'s Homebridge " + button_json["service_name"] + " button to " + button_state)
-                                            self.outgoing_mqtt(pb_parsed_json)
-                                        elif str(target_preset) == on_preset or str(target_preset) == warm_preset:
-                                            pb_parsed_json["value"] = True
-                                            button_state = "On"
-                                            LOG.debug("Update Area " + button_json["name"] + "'s Homebridge " + button_json["service_name"] + " button to " + button_state)
-                                            self.outgoing_mqtt(pb_parsed_json)
-                                        else:
-                                            LOG.info("Neither On, Off nor Warm presets selected")
-                                        LOG.debug("Matching Linked Area")
-                                        self.match_linked_area(area_updated, off_preset, on_preset)
-                                    all_channels_off = True #Set Area HB button state if all channels are either on or off
-                                    all_channels_on = True
-                                    for channel in self.cfg[CONF_AREA][area_updated][CONF_CHANNEL]:
-                                        LOG.debug("Channel " + str(channel) + " Preset " + str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][channel]["Preset"]))
-                                        if str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][channel]["Preset"]) != off_preset:
-                                            all_channels_off = False
-                                        if str(self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][channel]["Preset"]) != on_preset:
-                                            all_channels_on = False
-                                    if all_channels_off: # Set area HB button to off if all channels are off
-                                        pb_parsed_json = {}
-                                        pb_parsed_json["name"] = button_json["name"]
-                                        pb_parsed_json["service_name"] = button_json["name"]
-                                        pb_parsed_json["characteristic"] = "On"
-                                        pb_parsed_json["value"] = False
-                                        self.outgoing_mqtt(pb_parsed_json)
-                                    elif all_channels_on: # Set area HB button to on if all channels are on
-                                        pb_parsed_json = {}
-                                        pb_parsed_json["name"] = button_json["name"]
-                                        pb_parsed_json["service_name"] = button_json["name"]
-                                        pb_parsed_json["characteristic"] = "On"
-                                        pb_parsed_json["value"] =True
-                                        self.outgoing_mqtt(pb_parsed_json)
-                            if not button_found:
-                               LOG.debug("No Homebridge button found for Area Name: " + self.cfg[CONF_AREA][area_updated][CONF_NAME] + " Channel Name: " + self.cfg[CONF_AREA][area_updated][CONF_CHANNEL][str(channel_updated)][CONF_NAME]) 
-                        else:
-                            LOG.debug("No preset set in channel update")
-                    else:
-                        LOG.debug("Not a command, ignore")
-                else:
-                    LOG.debug("No Channel updated")
-            else:
-                LOG.debug("No channel is defined in config for Area " + str(area_updated) + " " + self.cfg[CONF_AREA][area_updated][CONF_NAME])
-        else:
-            LOG.info("Area not found in config")
-            
-    def match_channel_presets(self, area, preset): #Match an area's channel presets and its channels' Homebridge button states to the area's preset state
-        target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(self.cfg[CONF_AREA][area][CONF_NAME])
-        hb_button_json = {} # Find relevant homebridge buttons for the area that's been preset
-        for button_json in self.hb_cfg:
-            if button_json["name"] == self.cfg[CONF_AREA][area][CONF_NAME]:
-                hb_button_json = button_json
-        if CONF_CHANNEL in self.cfg[CONF_AREA][area]:
-            for channel in self.cfg[CONF_AREA][area][CONF_CHANNEL]: #Update Channel Presets to reflect new area preset
-                LOG.debug("Old Channel Preset. Area: " + str(area) + " Channel: " + str(channel) + " Preset: " + str(self.cfg[CONF_AREA][area][CONF_CHANNEL][channel]["Preset"]))
-                self.cfg[CONF_AREA][area][CONF_CHANNEL][channel]["Preset"] = str(preset)
-                LOG.debug("New Channel Preset. Area: " + str(area) + " Channel: " + str(channel) + " Preset: " + str(self.cfg[CONF_AREA][area][CONF_CHANNEL][channel]["Preset"]))
-                if hb_button_json != {}: # Update the channel homebridge buttons (if present)
-                    if hb_button_json["service_name"] == self.cfg[CONF_AREA][area][CONF_CHANNEL][str(channel)][CONF_NAME]:
-                        button_found = True
-                        pb_parsed_json = {}
-                        pb_parsed_json["name"] = hb_button_json["name"]
-                        pb_parsed_json["service_name"] = hb_button_json["service_name"]
-                        pb_parsed_json["characteristic"] = "On"
-                        if str(preset) == off_preset:
-                            pb_parsed_json["value"] = False
-                            button_state = "Off"
-                            LOG.debug("Update Area " + hb_button_json["name"] + "'s Homebridge " + hb_button_json["service_name"] + " button to " + button_state)
-                            self.outgoing_mqtt(pb_parsed_json)
-                        elif str(preset) == on_preset or str(preset) == warm_preset:
-                            pb_parsed_json["value"] = True
-                            button_state = "On"
-                            LOG.debug("Update Area " + hb_button_json["name"] + "'s Homebridge " + hb_button_json["service_name"] + " button to " + button_state)
-                            self.outgoing_mqtt(pb_parsed_json)
-                        else:
-                            LOG.info("Neither On, Off nor Warm presets selected")
-                
-    def match_linked_hb_channels(self, area_updated, light_state): # Match Homebridge Light buttons and Dynalite states for Linked Channels.
-        if "Linked" in self.cfg[CONF_AREA][area_updated]:
-            LOG.debug("Linked " + str(self.cfg[CONF_AREA][area_updated]))
-            if self.cfg[CONF_AREA][area_updated]["Linked"]["Master"]: # If it's the Master Area, update the Slave Area's Dynalite setting and HB button
-                pbl_parsed_json = {}
-                pbl_parsed_json["characteristic"] = "On"
-                pbl_parsed_json["name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
-                pbl_parsed_json["service_name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
-                pbl_parsed_json["value"] = light_state
-                LOG.debug("Operate Light 1 " + str(pbl_parsed_json))
-                pb_parsed_json = self.operate_light(pbl_parsed_json, switch_entire_area=True, match_linked_area=False)
-                LOG.debug("HB1 Message " + str(pbl_parsed_json))
-                self.outgoing_mqtt(pbl_parsed_json)
-                for channel in self.cfg[CONF_AREA][area_updated]["Linked"]["Channels"]: # Update the Master Area's HB channel buttons
-                    pbl1_parsed_json = {}
-                    pbl1_parsed_json["characteristic"] = "On"
-                    pbl1_parsed_json["name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-                    pbl1_parsed_json["service_name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_CHANNEL][str(channel)][CONF_NAME]
-                    pbl1_parsed_json["value"] = light_state
-                    LOG.debug("HB2 Message " + str(pbl1_parsed_json))
-                    self.outgoing_mqtt(pbl1_parsed_json)  
-            else: # If it's the Slave Area, update the Master Area's Dynalite Channel and HB settings
-                for channel in self.cfg[CONF_AREA][area_updated]["Linked"]["Channels"]:
-                    pbl2_parsed_json = {}
-                    pbl2_parsed_json["characteristic"] = "On"
-                    pbl2_parsed_json["name"] = self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_NAME]
-                    pbl2_parsed_json["service_name"] =self.cfg[CONF_AREA][self.cfg[CONF_AREA][area_updated]["Linked"]["Area"]][CONF_CHANNEL][str(channel)][CONF_NAME]
-                    pbl2_parsed_json["value"] = light_state
-                    pb_parsed_json = self.operate_light(pbl2_parsed_json, switch_entire_area=False, match_linked_area=False)
-                    LOG.debug("HB3 Message " + str(pbl2_parsed_json))
-                    self.outgoing_mqtt(pbl2_parsed_json)  
-        
-    def update_hb_preset(self, event_data): #Update an area's Homebridge button's state to match the state of its Dynalite area's preset state
-        LOG.debug("Update HB Preset " + str(event_data))
-        area_updated = None
-        for area in self.cfg[CONF_AREA]: #Find area and preset that's been updated and capture its new state
-            if area == event_data[CONF_AREA]:
-                LOG.debug("Old States " + str(self.cfg[CONF_AREA][area]))
-                area_updated = area
-                preset_updated = event_data[CONF_PRESET]
-                updated_state = event_data["state"]
-                if updated_state == "ON":
-                    other_states = "OFF"
-                if str(preset_updated) in self.cfg[CONF_AREA][area][CONF_PRESET]:      
-                    for preset in self.cfg[CONF_AREA][area][CONF_PRESET]:
-                        if preset == str(preset_updated): #Update config to reflect new states
-                            self.cfg[CONF_AREA][area][CONF_PRESET][preset]["state"] = updated_state
-                        else:
-                            self.cfg[CONF_AREA][area][CONF_PRESET][preset]["state"] = other_states
-                    self.match_channel_presets(area_updated, preset_updated)                          
-                else:
-                    LOG.info("Preset not found in config. Area: " + str(area_updated) + " Preset: " + str(preset_updated))
-                    return
-        if area_updated != None:
-            pb_parsed_json = {}
-            pb_parsed_json["name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-            pb_parsed_json["service_name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-            pb_parsed_json["characteristic"] = "On"
-            hb_service_found = False
-            if "Light" in self.cfg[CONF_AREA][area_updated][CONF_NAME]:
-                hb_service_found = True
-                target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(self.cfg[CONF_AREA][area_updated][CONF_NAME])
-                if warm_preset != None:
-                    pb_parsed_json_warm = {}
-                    pb_parsed_json_warm["name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-                    pb_parsed_json_warm["service_name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-                    pb_parsed_json_warm["characteristic"] = "ColorTemperature"
-                    if str(preset_updated) == warm_preset:
-                        if updated_state == "ON":
-                            pb_parsed_json["value"] = True
-                            pb_parsed_json_warm["value"] = 400
-                            self.outgoing_mqtt(pb_parsed_json_warm)
-                    elif str(preset_updated) != off_preset:
-                        if updated_state == "ON":
-                            pb_parsed_json["value"] = True
-                            pb_parsed_json_warm["value"] = 140
-                        self.outgoing_mqtt(pb_parsed_json_warm)
-                    else:
-                        pb_parsed_json["value"] = False
-                    self.outgoing_mqtt(pb_parsed_json)
-                else:
-                    light_state = False
-                    if str(preset_updated) != off_preset: #Update Homebridge without catering for a warm preset if the light's not cct
-                        if updated_state == "ON":
-                            light_state = True
-                    pb_parsed_json["value"] = light_state
-                    self.outgoing_mqtt(pb_parsed_json) #Publish non-cct light Homebridge message
-                    self.match_linked_hb_channels(area_updated, light_state) # Match Homebridge Light buttons and Dynalite states for Linked Channels                 
-            elif "Window" in self.cfg[CONF_AREA][area_updated][CONF_NAME]:
-                hb_service_found = True
-                LOG.debug("Window")
-                pb_parsed_json["service_name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-                if self.cfg[CONF_AREA][area_updated][CONF_PRESET][str(preset_updated)][CONF_NAME] == "Open":
-                    hb_open_value = 100
-                else:
-                    hb_open_value = 0
-                pb_parsed_json["characteristic"] = "TargetPosition"
-                pb_parsed_json["value"] = hb_open_value
-                self.outgoing_mqtt(pb_parsed_json)
-                pb_parsed_json1 = {}
-                pb_parsed_json1["name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-                pb_parsed_json1["service_name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-                pb_parsed_json1["characteristic"] = "CurrentPosition"
-                pb_parsed_json1["value"] = hb_open_value
-                self.outgoing_mqtt(pb_parsed_json1)
-            elif "Shutters" in self.cfg[CONF_AREA][area_updated][CONF_NAME]:
-                hb_service_found = True
-                LOG.debug("Shutters")
-                pb_parsed_json["service_name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-                if self.cfg[CONF_AREA][area_updated][CONF_PRESET][str(preset_updated)][CONF_NAME] == "Open":
-                    hb_open_value = 100
-                else:
-                    hb_open_value = 0
-                pb_parsed_json["characteristic"] = "TargetPosition"
-                pb_parsed_json["value"] = hb_open_value
-                self.outgoing_mqtt(pb_parsed_json)
-                pb_parsed_json1 = {}
-                pb_parsed_json1["name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-                pb_parsed_json1["service_name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-                pb_parsed_json1["characteristic"] = "CurrentPosition"
-                pb_parsed_json1["value"] = hb_open_value
-                self.outgoing_mqtt(pb_parsed_json1)
-            elif "Good Morning" in self.cfg[CONF_AREA][area_updated][CONF_NAME]: #This is a special that uses a dynalite "Good Morning" button to open Main Bedroom shades that respond to the hb_incoming topic
-                hb_service_found = True
-                LOG.info("Main Bedroom Good Morning Pressed")
-                pb_parsed_json = {}
-                pb_parsed_json["name"] = "Main Room Shades"
-                pb_parsed_json["service_name"] = "Day Fresh"
-                if self.cfg[CONF_AREA][area_updated][CONF_PRESET][str(preset_updated)][CONF_NAME] == "On":
-                    hb_open_value = 100
-                else:
-                    hb_open_value = 0
-                pb_parsed_json["characteristic"] = "TargetPosition"
-                pb_parsed_json["value"] = hb_open_value
-                self.outgoing_mqtt(pb_parsed_json, topic=self.hb_incoming_mqtt_topic)
-            else:
-                for function in self.hb_switch_functions:
-                    if function in self.cfg[CONF_AREA][area_updated][CONF_NAME]:
-                        hb_service_found = True
-                        LOG.debug("Switch")
-                        pb_parsed_json["service_name"] = self.cfg[CONF_AREA][area_updated][CONF_NAME]
-                        pb_parsed_json["characteristic"] = "On"
-                        if self.cfg[CONF_AREA][area_updated][CONF_PRESET][str(preset_updated)][CONF_NAME] == "On":
-                            pb_parsed_json["value"] = True
-                        else:
-                            pb_parsed_json["value"] = False
-                        self.outgoing_mqtt(pb_parsed_json)               
-            if not hb_service_found:
-                LOG.info("Homebridge Service not found for Area: " + self.cfg[CONF_AREA][area_updated][CONF_NAME])    
-            LOG.debug("New States " + str(self.cfg[CONF_AREA][area_updated]))
-        else:
-            LOG.info("Updated Area not found in config " + str(event_data))
-                    
-    def operate_window(self, parsed_json): #Respond to a Homebridge operate window button
-        target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(parsed_json["name"])
-        LOG.debug("Operating " + parsed_json["name"])
-        LOG.debug("Target Area: " + str(target_area) + " Off Preset: " + str(off_preset) + " On Preset: " + str(on_preset) + " Warm Preset: " + str(warm_preset))
-        if target_area == None or on_preset == None or off_preset == None:
-            LOG.info(parsed_json["name"] + " and/or its presets not found in config")
-            return None
-        else:
-            if parsed_json["value"] == 0:
-                target_preset = off_preset
-                non_target_preset = on_preset
-                window_action = "closing"
-            else:
-                target_preset = on_preset
-                non_target_preset = off_preset
-                window_action = "opening"
-        LOG.info(parsed_json["name"] + " " + window_action + ". Area " + str(target_area) + ", Preset " + target_preset)
-        self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset))
-        self.cfg[CONF_AREA][int(target_area)][CONF_PRESET][str(target_preset)]["state"] = "On"
-        self.cfg[CONF_AREA][int(target_area)][CONF_PRESET][str(non_target_preset)]["state"] = "Off"
-        pb_parsed_json = {}
-        pb_parsed_json["name"] = parsed_json["name"]
-        pb_parsed_json["service_name"] = parsed_json["service_name"]
-        pb_parsed_json["characteristic"] = "CurrentPosition"
-        pb_parsed_json["value"] = parsed_json["value"]
-        return pb_parsed_json #Return a parsed_json that shows the window's post-command postion
-    
-    def operate_switch(self, parsed_json): #Respond to a Homebridge operate switch button
-        target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(parsed_json["name"])
-        LOG.debug("Operating " + parsed_json["name"])
-        LOG.debug("Target Area: " + str(target_area) + " Off Preset: " + str(off_preset) + " On Preset: " + str(on_preset) + " Warm Preset: " + str(warm_preset))
-        if target_area == None or on_preset == None or off_preset == None:
-            LOG.info(parsed_json["name"] + " and/or its presets not found in config")
-            return {}
-        else:
-            if parsed_json["value"] == 0:
-                target_preset = off_preset
-                non_target_preset = on_preset
-                switch_action = "turning off"
-            else:
-                target_preset = on_preset
-                non_target_preset = off_preset
-                switch_action = "turning on"
-        LOG.info(parsed_json["name"] + " " + switch_action + ". Area " + str(target_area) + ", Preset " + target_preset)
-        self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset))
-        self.cfg[CONF_AREA][int(target_area)][CONF_PRESET][str(target_preset)]["state"] = "On"
-        self.cfg[CONF_AREA][int(target_area)][CONF_PRESET][str(non_target_preset)]["state"] = "Off"
-        return {}
-    
-    def operate_light(self, parsed_json, switch_entire_area=False, match_linked_area=True): #Respond to a Homebridge operate light button when match_linked_area is True and set linked lights when matched_linked_area is False
-        target_area, off_preset, on_preset, warm_preset = self.identify_area_presets(parsed_json["name"])
-        LOG.debug("Operating " + parsed_json["service_name"])
-        LOG.debug("Target Area: " + str(target_area) + " Off Preset: " + str(off_preset) + " On Preset: " + str(on_preset) + " Warm Preset: " + str(warm_preset))
-        if target_area != None and on_preset != None and off_preset != None:
-            if parsed_json["name"] == parsed_json["service_name"]: # Unequal when operating a light within an area
-                operate_entire_area = True
-                if "cct" in self.cfg[CONF_AREA][target_area]:
-                    cct = True
-                else:
-                    cct = False
-            else:
-                operate_entire_area = False
-                target_one_channel = self.identify_target_channel(int(target_area), parsed_json["service_name"]) #Find the target channel
-                if target_one_channel == None:
-                    LOG.info(parsed_json["service_name"] + " not found in config")
-                    return {}
-                if "cct" in self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]:
-                    cct = True
-                else:
-                    cct = False
-            if parsed_json["characteristic"] == "On": #If the light is being switched, without changing it's dimming level
-                hb_brightness = self.cfg[CONF_AREA][target_area]["level"]
-                if operate_entire_area:
-                    if parsed_json["value"] and not cct: #Only cater for on state if the light isn't cct
-                        target_preset = on_preset
-                        non_target_presets = self.identify_non_target_presets(target_area, target_preset)
-                        non_cct_light_action = "turning on"
-                    elif parsed_json["value"] and cct: #Use use the light's cct state in cfg to determine whether it should be warm or cool when turned on
-                        if self.cfg[CONF_AREA][target_area]["cct"] == "Warm":
-                            target_preset = warm_preset
-                            non_target_presets = self.identify_non_target_presets(target_area, target_preset)
-                            non_cct_light_action = "turning on"
-                            cct_light_action = "setting to warm"
-                            self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset)) # Set to warm before setting level
-                        else:
-                            target_preset = on_preset
-                            non_target_presets = self.identify_non_target_presets(target_area, target_preset)
-                            non_cct_light_action = "turning on"
-                            cct_light_action = "setting to cool"
-                            self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset)) # Set to cool before setting level
-                    else: #Set to off
-                        target_preset = off_preset
-                        non_target_presets = self.identify_non_target_presets(target_area, target_preset)
-                        non_cct_light_action = "turning off"
-                        cct_light_action = "turning off"
-                        hb_brightness = 0
-                    target_channels = self.identify_area_channels(target_area)
-                    if target_channels != [] and not switch_entire_area: #Switch individual channels
-                        for target_channel in target_channels:
-                            if "cct" in self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)]:
-                                light_action = cct_light_action
-                            else:
-                                light_action = non_cct_light_action
-                            LOG.debug("Targeted Channel: " + str(target_channel))
-                            LOG.info(parsed_json["name"] + " " + self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
-                            self.dyn.devices[CONF_AREA][target_area].channel[target_channel].turnOn(brightness=hb_brightness)
-                            for button_json in self.hb_cfg:
-                                if button_json["name"] == self.cfg[CONF_AREA][target_area][CONF_NAME] and button_json["service_name"] == self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME]:
-                                    pb_parsed_json = {}
-                                    pb_parsed_json["name"] = button_json["name"]
-                                    pb_parsed_json["service_name"] = button_json["service_name"]
-                                    pb_parsed_json["characteristic"] = "On"
-                                    if hb_brightness == 0: #Turn off the Homebridge button for area channels that have their own button, when its area is turned off
-                                        pb_parsed_json["value"] = False
-                                    else:
-                                        pb_parsed_json["value"] = True
-                                    self.outgoing_mqtt(pb_parsed_json)                                    
-                    self.cfg[CONF_AREA][target_area][CONF_PRESET][str(target_preset)]["state"] = "On"
-                    if non_target_presets != []:
-                        for preset in non_target_presets:
-                            self.cfg[CONF_AREA][target_area][CONF_PRESET][str(preset)]["state"] = "Off"
-                    self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset)) # Set area preset
-                    if match_linked_area: #Prevents recursive loops
-                        self.match_channel_presets(target_area, target_preset)
-                        if target_preset == off_preset:
-                            light_state = False
-                        else:
-                            light_state = True
-                        LOG.debug("Calling match_linked_hb_channels " + str(target_area) + " " + str(light_state))
-                        self.match_linked_hb_channels(target_area, light_state)
-                else:
-                    if parsed_json["value"]:
-                        hb_brightness = self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]["level"]
-                        light_action = "turning on"
-                        channel_preset = on_preset
-                    else:
-                        hb_brightness = 0
-                        light_action = "turning off"
-                        channel_preset = off_preset
-                    LOG.debug("Old Channel Preset. Area: " + str(target_area) + " Channel: " + str(target_one_channel) + " Preset: " + str(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]["Preset"]))
-                    self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]["Preset"] = str(channel_preset)
-                    LOG.debug("New Channel Preset. Area: " + str(target_area) + " Channel: " + str(target_one_channel) + " Preset: " + str(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]["Preset"]))
-                    LOG.debug("Targeted Channel: " + str(target_one_channel))
-                    LOG.info(parsed_json["name"] + " " + parsed_json["service_name"] + " " + light_action + ". Area " + str(target_area) + ", Channel " + target_one_channel)
-                    self.dyn.devices[CONF_AREA][target_area].channel[int(target_one_channel)].turnOn(brightness=hb_brightness)
-                    if match_linked_area: #Prevents recursive loops by only calling match_linked_area when operating the primary area
-                        LOG.debug("Calling match_linked_area " + str(target_area) + " " + str(off_preset) + " " + str(on_preset))
-                        self.match_linked_area(target_area, off_preset, on_preset)
-            elif parsed_json["characteristic"] == "Brightness":
-                hb_brightness = parsed_json["value"]/100
-                light_action = "brightness changing to "
-                if operate_entire_area:
-                    target_channels = self.identify_area_channels(target_area)
-                    if target_channels != []:
-                        for target_channel in target_channels:
-                            LOG.debug("Targeted Channel: " + str(target_channel))
-                            LOG.info(parsed_json["name"] + " " + self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + light_action + str(parsed_json["value"]) + "%. Area " + str(target_area) + ", Channel " + str(target_channel))
-                            self.dyn.devices[CONF_AREA][target_area].channel[target_channel].turnOn(brightness=hb_brightness)
-                            self.cfg[CONF_AREA][target_area]["level"] = hb_brightness
-                            self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)]["level"] = hb_brightness
-                else:
-                    LOG.info(parsed_json["name"] + " " + self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel][CONF_NAME] + " " + light_action + str(parsed_json["value"]) + "%. Area " + str(target_area) + ", Channel " + target_one_channel)
-                    self.dyn.devices[CONF_AREA][target_area].channel[int(target_one_channel)].turnOn(brightness=hb_brightness)
-                    self.cfg[CONF_AREA][target_area][CONF_CHANNEL][target_one_channel]["level"] = hb_brightness
-            elif parsed_json["characteristic"] == "ColorTemperature":
-                if parsed_json["value"] < 250:
-                    target_cct = "Cool"
-                else:
-                    target_cct = "Warm"
-                if "cct" in self.cfg[CONF_AREA][target_area]: #Only make a change if the area is configured with cct lights
-                    self.cfg[CONF_AREA][target_area]["cct"] = target_cct #Update area in config to request cct colour
-                    non_cct_channels = [] #List channels that do not have cct lights
-                    for channel in self.cfg[CONF_AREA][target_area][CONF_CHANNEL]:
-                        if "cct" in self.cfg[CONF_AREA][target_area][CONF_CHANNEL][channel]:
-                            self.cfg[CONF_AREA][target_area][CONF_CHANNEL][channel]["cct"] = target_cct
-                        else:
-                            non_cct_channels.append(channel)
-                    drive_cct_change = False #Check if the area is already set to the requested cct colour. If not, update its config and flag that the area's preset is to be changed.
-                    if target_cct == "Cool":
-                        target_preset = on_preset
-                        if self.cfg[CONF_AREA][target_area][CONF_PRESET][warm_preset]["state"] == "On":
-                            drive_cct_change = True
-                            cct_light_action = "setting to cool"
-                            non_cct_light_action = "turning on"
-                            self.cfg[CONF_AREA][target_area][CONF_PRESET][warm_preset]["state"] = "Off"
-                            self.cfg[CONF_AREA][target_area][CONF_PRESET][on_preset]["state"] = "On"               
-                    else:
-                        target_preset = warm_preset
-                        if self.cfg[CONF_AREA][target_area][CONF_PRESET][warm_preset]["state"] == "Off":
-                            drive_cct_change = True
-                            cct_light_action = "setting to warm"
-                            non_cct_light_action = "turning on"
-                            self.cfg[CONF_AREA][target_area][CONF_PRESET][warm_preset]["state"] = "On"
-                            self.cfg[CONF_AREA][target_area][CONF_PRESET][on_preset]["state"] = "Off"
-                    if drive_cct_change: #Change preset if a change is flagged and set brightness to previously set level
-                        LOG.debug("Setting Area Preset " + target_preset)
-                        self.dyn.devices[CONF_AREA][int(target_area)].presetOn(int(target_preset))
-                        target_channels = self.identify_area_channels(target_area) #List the channels in the area
-                        if not operate_entire_area:
-                            target_one_channel = self.identify_target_channel(int(target_area), parsed_json["service_name"])
-                            if target_one_channel == None:
-                                LOG.info(parsed_json["name"] + " " + parsed_json["service_name"] + " channel not found in config when trying to set its colour temperature")
-                                return {}
-                        if target_channels != []:
-                            for target_channel in target_channels:
-                                LOG.debug("Targeted Channel: " + str(target_channel))
-                                if operate_entire_area:
-                                    hb_brightness = self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)]["level"]
-                                    if str(target_channel) in non_cct_channels:
-                                        LOG.info(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + non_cct_light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
-                                    else:
-                                        LOG.info(self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + cct_light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
-                                elif target_channel == int(target_one_channel):
-                                    hb_brightness = self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)]["level"]
-                                    LOG.info(parsed_json["name"] + " " + self.cfg[CONF_AREA][target_area][CONF_CHANNEL][str(target_channel)][CONF_NAME] + " " + cct_light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
-                                else:
-                                    LOG.debug("Neither Entire Area nor Target Channel" + " " + cct_light_action + ". Area " + str(target_area) + ", Channel " + str(target_channel))
-                                    hb_brightness = 0
-                                self.dyn.devices[CONF_AREA][target_area].channel[target_channel].turnOn(brightness=hb_brightness)
-            else:
-                LOG.info("No valid light characteristic")
-            return {}       
-        else:
-            LOG.info(parsed_json["name"] + " and/or its presets not found in config")
-        return {}
 
+    async def mqtt_publisher(self):
+        while True:
+            try:
+                async with aiomqtt.Client("<Your mqtt Broker IP Address>") as client:
+                    LOG.info("MQTT publisher connected")
+                    while True:
+                        topic, payload = await self.mqtt_out_queue.get()
+                        await client.publish(topic, payload, qos=1, retain=False)
+            except asyncio.CancelledError:
+                raise
+            except aiomqtt.MqttError as e:
+                LOG.error("MQTT publish connection lost: %s", e)
+                await asyncio.sleep(2)
+
+    def outgoing_mqtt(self, pb_parsed_json, topic="homebridge/to/set"):
+        if not self.check_valid_hb_message(pb_parsed_json):
+            return
+        payload = json.dumps(pb_parsed_json)
+        try:
+            self.mqtt_out_queue.put_nowait((topic, payload))
+        except asyncio.QueueFull:
+            LOG.warning("MQTT queue full, dropping message: %s", payload)
+
+    def safe_task(self, coro_factory, name):
+        async def runner():
+            while True:
+                try:
+                    await coro_factory()
+                except Exception as e:
+                    LOG.error("Task '%s' crashed: %s — restarting", name, e)
+                    await asyncio.sleep(2)
+        self.loop.create_task(runner())
+                
 def handleEvent(event=None, dynalite=None):
     event_json = json.loads(event.toJson())
     if event_json["eventType"] == "CHANNEL" and event_json["direction"] == "IN":
-        hbmqtt.update_hb_channel(event_json["data"])
+        hbmqtt.controller.update_hb_channel(event_json["data"])
         LOG.debug("Channel Event " + str(event_json["data"]))
     elif event_json["eventType"] == "PRESET" and event_json["direction"] == "IN":
-        hbmqtt.update_hb_preset(event_json["data"])
+        hbmqtt.controller.update_hb_preset(event_json["data"])
         LOG.debug("Preset Event " + str(event_json["data"]))
 
 def handleConnect(event=None, dynalite=None):
     LOG.debug("Connected to Dynalite")
-    hbmqtt.in_message(test_mode=None) #Use for testing via console. Starts console input async task loop. Use test_mode="Area Preset" for testing area presets, test_mode="Channel Level" for testing channel levels or test_mode=None to disable.
-    hbmqtt.incoming_mqtt() #Start Homebridge incoming mqtt async task loop
+    hbmqtt.in_message(test_mode=None)
+    # Incoming MQTT listener
+    hbmqtt.safe_task(lambda: hbmqtt._incoming_mqtt(), "incoming_mqtt")
+    hbmqtt.safe_task(lambda: hbmqtt.mqtt_publisher(), "mqtt_publisher")
     
 if __name__ == '__main__':
     #Set up the config dictionary
@@ -731,7 +198,7 @@ if __name__ == '__main__':
                                                                                                                                                                                           "4": {"name": "Off", "state": ""}}, "level": 1},
                     13: {"name": "Laundry Light", "channel": {"1": {"name": "Ceiling Light", "level": 1, "Preset": ""}, "2": {"name": "Benchtop Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""},
                                                                                                                                                                          "3": {"name":"Low", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1},
-                    14: {"name": "South Light",  "channel": {"1": {"name": "Pendant Light", "level": 1, "Preset": ""}, "2": {"name": "Ceiling Light", "level": 1, "Preset": ""}, "3": {"name": "Left Bedside Light", "level": 1, "Preset": ""},
+                    14: {"name": "South Light",  "channel": {"1": {"name": "Ceiling Light", "level": 1, "Preset": ""}, "2": {"name": "Pendant Light", "level": 1, "Preset": ""}, "3": {"name": "Left Bedside Light", "level": 1, "Preset": ""},
                                                              "4": {"name": "Right Bedside Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": ""}, "2": {"name":"Med", "state": ""}, "3": {"name":"Low", "state": ""},
                                                                                                                               "4": {"name": "Off", "state": ""}}, "level": 1, "Linked": {"Area": 26, "Channels": [3, 4], "Master": True}},
                     15: {"name": "South Ensuite Light", "channel": {"1": {"name": "Ceiling Light", "level": 1, "Preset": ""}, "2": {"name": "Vanity Light", "level": 1, "Preset": ""}}, "preset": {"1": {"name": "On", "state": "", "state": ""},
@@ -826,6 +293,8 @@ if __name__ == '__main__':
     onConnect.monitorEvent('CONNECTED')
     dynalite.start()
     loop.run_forever()
+        
+    
 
      
     
