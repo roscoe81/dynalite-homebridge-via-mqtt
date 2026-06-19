@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#Northcliff Rain Monitor 1_0 - Gen
+#Northcliff Rain Monitor 1_1 - Gen
 import asyncio
 import json
 import logging
@@ -48,7 +48,7 @@ class RainMonitor:
                     chance = self._current_hour_chance(forecast_data)
                     raining = chance >= self.rain_chance_threshold
                     LOG.info("Rain Check: %d%% chance this hour - State: %s",
-                             chance, "Raining" if self._raining else "Clear")
+                             chance, "Raining" if raining else "Clear")
                     if raining:
                         self._last_rain_time = now
                         if not self._raining:
