@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#Northcliff Dynalite Controller - Version 1.0 - Gen
+#Northcliff Dynalite Controller - Version 2.0 Support Rain Detector for Window Closure - Gen
 import logging
 from dynalite_lib.const import(CONF_AREA, CONF_NAME, CONF_PRESET, CONF_CHANNEL)
 
@@ -380,6 +380,25 @@ class DynaliteController:
         pb_parsed_json["value"] = parsed_json["value"]
         return pb_parsed_json #Return a parsed_json that shows the window's post-command postion
 
+    def close_rain_windows(self):
+        rain_windows = {"North Window", "South Window"}
+        for area in self.cfg[CONF_AREA]:
+            area_name = self.cfg[CONF_AREA][area][CONF_NAME]
+            if area_name in rain_windows:
+                target_area, off_preset, on_preset, _ = self.identify_area_presets(area_name)
+                if target_area is None or off_preset is None or on_preset is None:
+                    LOG.warning("Rain: %s - presets not found in config, skipping", area_name)
+                    continue
+                open_state = self.cfg[CONF_AREA][area][CONF_PRESET][str(on_preset)].get("state", "Off")
+                if open_state != "On":
+                    LOG.info("Rain: %s is already closed, skipping", area_name)
+                    continue
+                parsed_json = {"name": area_name, "service_name": area_name, "value": 0}
+                result = self.operate_window(parsed_json)
+                if result:
+                    self.outgoing_cb(result)
+                LOG.info("Rain: closing %s", area_name)
+
     def update_hb_channel(self, event_data): #Update a channel-specific Homebridge button's state to match the state of its area's preset. Match any linked area's dynalite state.
         LOG.debug("Update HB Channel " + str(event_data))
         area_updated = None
@@ -468,8 +487,7 @@ class DynaliteController:
                 area_updated = area
                 preset_updated = event_data[CONF_PRESET]
                 updated_state = event_data["state"]
-                if updated_state == "ON":
-                    other_states = "OFF"
+                other_states = "OFF" if updated_state == "ON" else "ON"
                 if str(preset_updated) in self.cfg[CONF_AREA][area][CONF_PRESET]:      
                     for preset in self.cfg[CONF_AREA][area][CONF_PRESET]:
                         if preset == str(preset_updated): #Update config to reflect new states

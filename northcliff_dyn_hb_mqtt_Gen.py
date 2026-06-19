@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#Northcliff Dynalite/Homebridge mqtt Bridge - Version 3.1 refactor 1 - Gen
+#Northcliff Dynalite/Homebridge mqtt Bridge - Version 4.0 Rain Detector for Window Closure - Gen
 import json
 import logging
 import asyncio
@@ -8,6 +8,7 @@ from dynalite_lib import Dynalite
 import aioconsole
 import asyncio_mqtt as aiomqtt
 from dynalite_lib.const import(CONF_AREA, CONF_NAME, CONF_PRESET, CONF_CHANNEL)
+from rain_monitor_Gen import RainMonitor
 
 #logging.basicConfig(level=logging.DEBUG,
 logging.basicConfig(level=logging.INFO,
@@ -27,6 +28,7 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
         self.cfg = config
         self.hb_cfg = hb_config
         self.loop = loop
+        self.bom_geohash = config.get("bom_geohash")
         self.message_count = 0 # Set watchdog message count
         self.watchdog_file_name = '/home/pi/Dyna_hb/watchdog.log'
         self.hb_incoming_mqtt_topic = "homebridge/from/set" #Topic for messages from the Homebridge mqtt plugin
@@ -63,7 +65,7 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
     async def _incoming_mqtt(self): #Capture, filter and action relevant incoming Homebridge mqtt messages
         while True:
             try:
-                async with aiomqtt.Client("<Your mqtt Broker IP Address") as client:
+                async with aiomqtt.Client("<Your mqtt Broker IP Address>") as client:
                     async with client.messages() as messages:
                         await client.subscribe("#")
                         LOG.info("Subscribed to %s", "#")                        
@@ -127,13 +129,22 @@ class DynaliteHBmqtt(object): #Class for Dynalite/Homebridge bridge via mqtt
         except asyncio.QueueFull:
             LOG.warning("MQTT queue full, dropping message: %s", payload)
 
+    async def _on_rain_detected(self, forecast_hour):
+        chance = forecast_hour.get("rain", {}).get("chance", 0)
+        LOG.info("Rain forecast %d%% this hour - closing North and South windows", chance)
+        self.controller.close_rain_windows()
+
+    async def _start_rain_monitor(self):
+        monitor = RainMonitor(self.bom_geohash)
+        await monitor.monitor(self._on_rain_detected)
+
     def safe_task(self, coro_factory, name):
         async def runner():
             while True:
                 try:
                     await coro_factory()
                 except Exception as e:
-                    LOG.error("Task '%s' crashed: %s — restarting", name, e)
+                    LOG.error("Task '%s' crashed: %s - restarting", name, e)
                     await asyncio.sleep(2)
         self.loop.create_task(runner())
                 
@@ -152,6 +163,8 @@ def handleConnect(event=None, dynalite=None):
     # Incoming MQTT listener
     hbmqtt.safe_task(lambda: hbmqtt._incoming_mqtt(), "incoming_mqtt")
     hbmqtt.safe_task(lambda: hbmqtt.mqtt_publisher(), "mqtt_publisher")
+    if hbmqtt.bom_geohash:
+        hbmqtt.safe_task(lambda: hbmqtt._start_rain_monitor(), "rain_monitor")
     
 if __name__ == '__main__':
     #Set up the config dictionary
@@ -233,7 +246,8 @@ if __name__ == '__main__':
                     142: {"name": "North Shutters", "preset": {"1": {"name": "Open", "state": ""}, "4": {"name": "Close", "state": ""}}, "level": 1},
                     143: {"name": "Main Ensuite Shutters", "preset": {"1": {"name": "Open", "state": ""}, "4": {"name": "Close", "state": ""}}, "level": 1},
                     148: {"name": "Main Good Morning", "preset": {"1": {"name": "On", "state": ""}, "4": {"name": "Off", "state": ""}}, "level": 1}},
-           "host": "<Your Dynalite Gateway IP Address>", "port": 8008, "autodiscover": True, "log_level": "logging.INFO", "log_formatter": '"[%(asctime)s] %(name)s {%(filename)s:%(lineno)d} %(levelname)s - %(message)s"'}
+           "host": "<Your Dynalite Gateway IP Address>", "port": 8008, "autodiscover": True, "log_level": "logging.INFO", "log_formatter": '"[%(asctime)s] %(name)s {%(filename)s:%(lineno)d} %(levelname)s - %(message)s"',
+           "bom_geohash": "r3gx2y"}
     
     #Set up the Homebridge config list to mirror how the Homebridge mqtt plug-in's accessories have been configured via Node-RED or the plug-in's homebridge/to/add and homebridge/to/add/service mqtt topics.
     #"name" is set to name of the dynalite area's name to be controlled by the respective button.
