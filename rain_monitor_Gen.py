@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#Northcliff Rain Monitor 1_1 - Gen
+#Northcliff Rain Monitor 2_0 - Gen
 import asyncio
 import json
 import logging
@@ -55,7 +55,7 @@ class RainMonitor:
                             self._raining = True
                             LOG.info("Rain forecast: %d%% chance this hour (threshold %d%%)",
                                      chance, self.rain_chance_threshold)
-                            await on_rain_start(forecast_data[0])
+                        await on_rain_start(forecast_data[0])
                     elif self._raining and self._last_rain_time is not None:
                         if now - self._last_rain_time > self.rain_clear_delay:
                             self._raining = False
