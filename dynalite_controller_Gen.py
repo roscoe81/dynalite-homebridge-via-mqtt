@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#Northcliff Dynalite Controller - Version 2.0 Support Rain Detector for Window Closure - Gen
+#Northcliff Dynalite Controller - Version 2.1 Fix Window state check - Gen
 import logging
 from dynalite_lib.const import(CONF_AREA, CONF_NAME, CONF_PRESET, CONF_CHANNEL)
 
@@ -390,7 +390,7 @@ class DynaliteController:
                     LOG.warning("Rain: %s - presets not found in config, skipping", area_name)
                     continue
                 open_state = self.cfg[CONF_AREA][area][CONF_PRESET][str(on_preset)].get("state", "Off")
-                if open_state != "On":
+                if open_state == "Off":
                     LOG.info("Rain: %s is already closed, skipping", area_name)
                     continue
                 parsed_json = {"name": area_name, "service_name": area_name, "value": 0}
